@@ -10,6 +10,7 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg", "pn
 md5 = "0.8.1"
 png = "0.18.1"
 resvg = "0.48.1"
+turbojpeg = { version = "1.5.1", default-features = false, features = ["pkg-config"] }
 
 [profile.dev.package."*"]
 opt-level = 3

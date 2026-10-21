@@ -256,21 +256,26 @@ mod tests {
         println!("fichier : {} Mo", fs::metadata(&path).unwrap().len() / 1_000_000);
 
         for _ in 0..3 {
+            // Chemin générique : décodage complet puis réduction.
             let t = Instant::now();
-            let (full, _) = formats::decode_rgba(&path, usize::MAX).unwrap();
+            let (full, _) = formats::decode_generic(&path, usize::MAX).unwrap();
             let t_full = t.elapsed();
             let t = Instant::now();
             let small = formats::resize_rgba(full, 256, 171).unwrap();
             let t_resize = t.elapsed();
+            // Chemin turbojpeg : décodage réduit par DCT.
+            let t = Instant::now();
+            let (fast, _) = formats::decode_rgba(&path, THUMB_SIZE).unwrap();
+            let t_turbo = t.elapsed();
             let t = Instant::now();
             let mut out = Vec::new();
             encode_png(&mut out, 256, 171, small.as_raw(), "file:///x", 1).unwrap();
             let t_png = t.elapsed();
-            let t = Instant::now();
-            decode_png(std::io::Cursor::new(out)).unwrap();
-            let t_png_read = t.elapsed();
             println!(
-                "décodage JPEG pleine taille {t_full:?} | réduction {t_resize:?} | écriture PNG {t_png:?} | relecture PNG {t_png_read:?}"
+                "générique : décodage {t_full:?} + réduction {t_resize:?} = {:?} | turbojpeg : {t_turbo:?} ({}x{}) | écriture PNG {t_png:?}",
+                t_full + t_resize,
+                fast.width(),
+                fast.height()
             );
         }
     }
