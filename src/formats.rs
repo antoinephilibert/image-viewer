@@ -3,7 +3,9 @@
 use std::path::Path;
 
 use eframe::egui::ColorImage;
-use image::{DynamicImage, ImageDecoder, ImageReader, imageops::FilterType};
+use fast_image_resize::images::Image as FirImage;
+use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
+use image::{DynamicImage, ImageDecoder, ImageReader, RgbaImage};
 
 /// Famille de format reconnue par extension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,15 +45,15 @@ pub fn decode(path: &Path, max_side: usize) -> Result<Decoded, String> {
     img.apply_orientation(orientation);
 
     let original_size = [img.width() as usize, img.height() as usize];
+    let mut rgba = img.into_rgba8();
     let largest = original_size[0].max(original_size[1]);
     if largest > max_side {
         let ratio = max_side as f64 / largest as f64;
         let w = ((original_size[0] as f64 * ratio) as u32).max(1);
         let h = ((original_size[1] as f64 * ratio) as u32).max(1);
-        img = img.resize_exact(w, h, FilterType::Triangle);
+        rgba = resize_rgba(rgba, w, h)?;
     }
 
-    let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     Ok(Decoded {
         pixels: ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
@@ -59,9 +61,30 @@ pub fn decode(path: &Path, max_side: usize) -> Result<Decoded, String> {
     })
 }
 
+/// Réduction SIMD (`fast_image_resize`), alpha géré par la bibliothèque.
+pub fn resize_rgba(src: RgbaImage, width: u32, height: u32) -> Result<RgbaImage, String> {
+    let (sw, sh) = (src.width(), src.height());
+    let src = FirImage::from_vec_u8(sw, sh, src.into_raw(), PixelType::U8x4)
+        .map_err(|e| e.to_string())?;
+    let mut dst = FirImage::new(width, height, PixelType::U8x4);
+    let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear));
+    Resizer::new()
+        .resize(&src, &mut dst, &options)
+        .map_err(|e| e.to_string())?;
+    RgbaImage::from_raw(width, height, dst.into_vec()).ok_or_else(|| "buffer invalide".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resize_halves_dimensions() {
+        let img = RgbaImage::from_pixel(8, 4, image::Rgba([10, 20, 30, 255]));
+        let out = resize_rgba(img, 4, 2).unwrap();
+        assert_eq!(out.dimensions(), (4, 2));
+        assert_eq!(out.get_pixel(0, 0).0, [10, 20, 30, 255]);
+    }
 
     #[test]
     fn detects_extensions_case_insensitively() {

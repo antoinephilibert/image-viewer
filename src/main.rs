@@ -1,5 +1,6 @@
 mod app;
 mod formats;
+mod loader;
 mod tree;
 
 use std::path::PathBuf;

@@ -5,7 +5,10 @@ edition = "2024"
 
 [dependencies]
 eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "wayland"] }
+fast_image_resize = "6.1.0"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
+md5 = "0.8.1"
+resvg = "0.48.1"
 
 [profile.dev.package."*"]
 opt-level = 3

@@ -1,16 +1,17 @@
 //! État de l'application et boucle egui.
 
+use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::path::PathBuf;
 
 use eframe::egui::{
     self, CentralPanel, Color32, Context, Key, Modifiers, Panel, Rect, ScrollArea, Sense,
     TextureHandle, TextureOptions, Vec2, pos2, vec2,
 };
 
-use crate::formats::{self, Decoded};
-use crate::tree::{Entry, NodeId, Tree, sort_entries};
+use crate::formats;
+use crate::loader::{Loader, Lru, Priority, Response};
+use crate::tree::{NodeId, Tree};
 
 const ROW_HEIGHT: f32 = 22.0;
 const INDENT: f32 = 14.0;
@@ -18,34 +19,36 @@ const BG_IMAGE: Color32 = Color32::from_rgb(24, 24, 27);
 const BG_PANEL: Color32 = Color32::from_rgb(32, 32, 36);
 const SELECTION: Color32 = Color32::from_rgb(56, 98, 168);
 
-/// Résultat de la lecture d'un dossier, renvoyé par un thread.
-struct DirLoaded {
-    /// Génération de l'arbre au moment de la requête (ignoré si re-raciné).
-    epoch: u64,
-    id: NodeId,
-    entries: Vec<Entry>,
-}
+/// Taille de la fenêtre de textures pleine taille : courante + voisines n±2.
+const FULL_CACHE_SLOTS: usize = 5;
 
-/// Image affichée à droite.
-struct Shown {
-    node: NodeId,
-    texture: Option<TextureHandle>,
+#[derive(Clone)]
+struct Cached {
+    texture: TextureHandle,
     original_size: [usize; 2],
     file_size: u64,
-    error: Option<String>,
+}
+
+/// Image actuellement affichée (ou son erreur).
+struct Display {
+    path: PathBuf,
+    item: Result<Cached, String>,
 }
 
 pub struct App {
     tree: Tree,
     epoch: u64,
-    tx: Sender<DirLoaded>,
-    rx: Receiver<DirLoaded>,
+    loader: Loader,
     ctx: Context,
+    cache: Lru<PathBuf, Cached>,
+    failed: HashMap<PathBuf, String>,
+    display: Option<Display>,
+    retarget_needed: bool,
+    max_side: usize,
     selected: Option<NodeId>,
     /// Chemin à sélectionner une fois son dossier lu.
     pending_select: Option<PathBuf>,
     show_hidden: bool,
-    shown: Option<Shown>,
     scroll_to_selected: bool,
     scroll_offset: f32,
     viewport_height: f32,
@@ -53,18 +56,20 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, root: PathBuf, select: Option<PathBuf>) -> Self {
-        let (tx, rx) = channel();
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let mut app = Self {
             tree: Tree::new(root),
             epoch: 0,
-            tx,
-            rx,
+            loader: Loader::new(&cc.egui_ctx),
             ctx: cc.egui_ctx.clone(),
+            cache: Lru::new(FULL_CACHE_SLOTS),
+            failed: HashMap::new(),
+            display: None,
+            retarget_needed: false,
+            max_side: 4096,
             selected: None,
             pending_select: select,
             show_hidden: false,
-            shown: None,
             scroll_to_selected: false,
             scroll_offset: 0.0,
             viewport_height: 0.0,
@@ -73,39 +78,66 @@ impl App {
         app
     }
 
-    /// Lance la lecture d'un dossier dans un thread dédié.
+    /// Demande la lecture d'un dossier au loader (hors thread UI).
     fn request_dir(&mut self, id: NodeId) {
         let node = &mut self.tree.nodes[id];
         if node.children.is_some() || node.loading {
             return;
         }
         node.loading = true;
-        let path = node.path.clone();
-        let (epoch, tx, ctx) = (self.epoch, self.tx.clone(), self.ctx.clone());
-        std::thread::spawn(move || {
-            let entries = read_dir(&path);
-            let _ = tx.send(DirLoaded { epoch, id, entries });
-            ctx.request_repaint();
-        });
+        self.loader.request_dir(self.epoch, id, node.path.clone());
     }
 
     fn drain_loaded(&mut self) {
-        while let Ok(msg) = self.rx.try_recv() {
-            if msg.epoch != self.epoch {
-                continue;
-            }
-            self.tree.set_children(msg.id, msg.entries);
-            if let Some(target) = &self.pending_select {
-                let found = self.tree.nodes[msg.id]
-                    .children
-                    .iter()
-                    .flatten()
-                    .copied()
-                    .find(|&c| self.tree.nodes[c].path == *target);
-                if let Some(c) = found {
-                    self.pending_select = None;
-                    self.select(Some(c));
+        while let Some(resp) = self.loader.try_recv() {
+            match resp {
+                Response::Dir { epoch, id, entries } => {
+                    if epoch == self.epoch {
+                        self.on_dir_loaded(id, entries);
+                    }
                 }
+                Response::Full { path, result } => self.on_full(path, result),
+            }
+        }
+    }
+
+    fn on_dir_loaded(&mut self, id: NodeId, entries: Vec<crate::tree::Entry>) {
+        self.tree.set_children(id, entries);
+        self.retarget_needed = true;
+        if let Some(target) = &self.pending_select {
+            let found = self.tree.nodes[id]
+                .children
+                .iter()
+                .flatten()
+                .copied()
+                .find(|&c| self.tree.nodes[c].path == *target);
+            if let Some(c) = found {
+                self.pending_select = None;
+                self.select(Some(c));
+            }
+        }
+    }
+
+    /// Une texture n'est créée que si l'image est encore voulue.
+    fn on_full(&mut self, path: PathBuf, result: Result<formats::Decoded, String>) {
+        if !self.loader.is_wanted(&path) || self.cache.contains(&path) {
+            return;
+        }
+        match result {
+            Ok(d) => {
+                let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let texture =
+                    self.ctx
+                        .load_texture(path.to_string_lossy(), d.pixels, TextureOptions::LINEAR);
+                let cached = Cached {
+                    texture,
+                    original_size: d.original_size,
+                    file_size,
+                };
+                self.cache.put(path, cached, 1);
+            }
+            Err(e) => {
+                self.failed.insert(path, e);
             }
         }
     }
@@ -114,6 +146,7 @@ impl App {
         if self.selected != id {
             self.selected = id;
             self.scroll_to_selected = true;
+            self.retarget_needed = true;
         }
     }
 
@@ -124,7 +157,8 @@ impl App {
         self.epoch += 1;
         self.tree = Tree::new(parent.to_path_buf());
         self.selected = None;
-        self.shown = None;
+        self.display = None;
+        self.retarget_needed = true;
         self.pending_select = Some(old);
         self.request_dir(Tree::ROOT);
     }
@@ -202,6 +236,7 @@ impl App {
         }
         if action.dot {
             self.show_hidden = !self.show_hidden;
+            self.retarget_needed = true;
         }
         if action.back {
             self.go_up();
@@ -268,41 +303,80 @@ impl App {
         // à cette étape, l'arbre est reconstruit à chaque re-racinage.
         self.tree.nodes[folder].children = None;
         self.selected = Some(folder);
-        self.shown = None;
+        self.display = None;
+        self.cache.clear();
+        self.failed.clear();
+        self.retarget_needed = true;
         self.request_dir(folder);
     }
 
-    /// Décode l'image sélectionnée (synchrone, toléré à l'étape 1 uniquement).
-    fn ensure_shown(&mut self, ctx: &Context) {
-        let want = self.selected.filter(|&s| self.is_image(s));
-        match (want, &self.shown) {
-            (Some(w), Some(s)) if s.node == w => return,
-            (None, _) => {
-                self.shown = None;
-                return;
+    /// Chemin de l'image sélectionnée, s'il y en a une.
+    fn selected_image_path(&self) -> Option<PathBuf> {
+        self.selected
+            .filter(|&s| self.is_image(s))
+            .map(|s| self.tree.nodes[s].path.clone())
+    }
+
+    /// Cibles voulues : image courante, puis voisines n±1 et n±2.
+    fn targets(&self) -> Vec<(PathBuf, Priority)> {
+        let Some(sel) = self.selected.filter(|&s| self.is_image(s)) else {
+            return vec![];
+        };
+        let imgs = self.folder_images();
+        let Some(idx) = imgs.iter().position(|&i| i == sel) else {
+            return vec![];
+        };
+        let path = |i: usize| self.tree.nodes[imgs[i]].path.clone();
+        let mut out = vec![(path(idx), Priority::Current)];
+        for (d, prio) in [(1, Priority::Neighbor1), (2, Priority::Neighbor2)] {
+            if idx + d < imgs.len() {
+                out.push((path(idx + d), prio));
             }
-            _ => {}
+            if idx >= d {
+                out.push((path(idx - d), prio));
+            }
         }
-        let w = want.unwrap();
-        let path = self.tree.nodes[w].path.clone();
-        let max_side = ctx.input(|i| i.max_texture_side);
-        let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        self.shown = Some(match formats::decode(&path, max_side) {
-            Ok(Decoded { pixels, original_size }) => Shown {
-                node: w,
-                texture: Some(ctx.load_texture("image", pixels, TextureOptions::LINEAR)),
-                original_size,
-                file_size,
-                error: None,
-            },
-            Err(e) => Shown {
-                node: w,
-                texture: None,
-                original_size: [0, 0],
-                file_size,
-                error: Some(e),
-            },
-        });
+        out
+    }
+
+    /// Met à jour les requêtes du loader et l'image affichée.
+    fn sync_images(&mut self, ctx: &Context) {
+        self.max_side = ctx.input(|i| i.max_texture_side);
+        if std::mem::take(&mut self.retarget_needed) {
+            let targets = self.targets();
+            // Garde les voisines déjà prêtes « fraîches » dans le LRU.
+            let ready: Vec<bool> = targets
+                .iter()
+                .map(|(p, _)| self.cache.get(p).is_some() || self.failed.contains_key(p))
+                .collect();
+            let known: std::collections::HashSet<&PathBuf> = targets
+                .iter()
+                .zip(&ready)
+                .filter(|(_, r)| **r)
+                .map(|((p, _), _)| p)
+                .collect();
+            self.loader
+                .retarget(&targets, self.max_side, |p| known.contains(&p.to_path_buf()));
+        }
+        let Some(path) = self.selected_image_path() else {
+            self.display = None;
+            return;
+        };
+        if self.display.as_ref().is_some_and(|d| d.path == path) {
+            return;
+        }
+        if let Some(c) = self.cache.get(&path) {
+            self.display = Some(Display {
+                path,
+                item: Ok(c.clone()),
+            });
+        } else if let Some(e) = self.failed.get(&path) {
+            self.display = Some(Display {
+                path,
+                item: Err(e.clone()),
+            });
+        }
+        // Sinon on garde l'image précédente à l'écran jusqu'à l'arrivée de la nouvelle.
     }
 
     fn tree_panel(&mut self, ui: &mut egui::Ui) {
@@ -376,47 +450,58 @@ impl App {
     }
 
     fn status_text(&self) -> String {
-        let Some(shown) = &self.shown else { return String::new() };
-        let node = &self.tree.nodes[shown.node];
+        let Some(d) = &self.display else {
+            return String::new();
+        };
+        let name = d
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let imgs = self.folder_images();
         let pos = imgs
             .iter()
-            .position(|&i| i == shown.node)
+            .position(|&i| self.tree.nodes[i].path == d.path)
             .map(|p| format!("{}/{}", p + 1, imgs.len()))
             .unwrap_or_default();
-        let [w, h] = shown.original_size;
-        format!(
-            "{}   {}×{}   {}   {}",
-            node.name,
-            w,
-            h,
-            human_size(shown.file_size),
-            pos
-        )
+        let loading = if self.selected_image_path().as_ref() == Some(&d.path) {
+            ""
+        } else {
+            "   …"
+        };
+        match &d.item {
+            Ok(c) => {
+                let [w, h] = c.original_size;
+                format!("{name}   {w}×{h}   {}   {pos}{loading}", human_size(c.file_size))
+            }
+            Err(_) => format!("{name}   {pos}{loading}"),
+        }
     }
 
     fn image_panel(&self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
         ui.painter().rect_filled(rect, 0.0, BG_IMAGE);
-        let Some(shown) = &self.shown else { return };
-        if let Some(err) = &shown.error {
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                err,
-                egui::FontId::proportional(14.0),
-                Color32::LIGHT_RED,
-            );
-            return;
-        }
-        let Some(tex) = &shown.texture else { return };
-        let [ow, oh] = shown.original_size;
+        let Some(display) = &self.display else { return };
+        let cached = match &display.item {
+            Ok(c) => c,
+            Err(err) => {
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    err,
+                    egui::FontId::proportional(14.0),
+                    Color32::LIGHT_RED,
+                );
+                return;
+            }
+        };
+        let [ow, oh] = cached.original_size;
         let avail = rect.size();
         let scale = (avail.x / ow as f32).min(avail.y / oh as f32).min(1.0);
         let size = Vec2::new(ow as f32 * scale, oh as f32 * scale);
         let img_rect = Rect::from_center_size(rect.center(), size);
         ui.painter().image(
-            tex.id(),
+            cached.texture.id(),
             img_rect,
             Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
             Color32::WHITE,
@@ -428,7 +513,7 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.drain_loaded();
         self.handle_keys(ctx);
-        self.ensure_shown(ctx);
+        self.sync_images(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -497,29 +582,6 @@ fn paint_chevron(ui: &egui::Ui, rect: Rect, depth: usize, open: bool) {
         Color32::GRAY,
         egui::Stroke::NONE,
     ));
-}
-
-/// Lit un dossier : ne garde que les dossiers et les images supportées.
-fn read_dir(path: &Path) -> Vec<Entry> {
-    let Ok(rd) = fs::read_dir(path) else { return vec![] };
-    let mut entries: Vec<Entry> = rd
-        .filter_map(Result::ok)
-        .filter_map(|e| {
-            let path = e.path();
-            // `fs::metadata` suit les liens symboliques.
-            let is_dir = fs::metadata(&path).ok()?.is_dir();
-            if !is_dir && formats::kind_of(&path).is_none() {
-                return None;
-            }
-            Some(Entry {
-                name: e.file_name().to_string_lossy().into_owned(),
-                path,
-                is_dir,
-            })
-        })
-        .collect();
-    sort_entries(&mut entries);
-    entries
 }
 
 fn human_size(bytes: u64) -> String {
