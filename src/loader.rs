@@ -12,9 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
-use eframe::egui::Context;
+use eframe::egui::{ColorImage, Context};
 
 use crate::formats::{self, Decoded};
+use crate::thumbs;
 use crate::tree::{Entry, NodeId, sort_entries};
 
 /// Priorité d'une requête; le premier variant passe en premier.
@@ -24,16 +25,25 @@ pub enum Priority {
     Current,
     Neighbor1,
     Neighbor2,
+    /// Vignette visible.
+    Thumb,
+    /// Vignette dans la marge autour de la zone visible.
+    Rest,
 }
 
 pub enum Job {
     Dir { epoch: u64, id: NodeId, path: PathBuf },
     Full { path: PathBuf, max_side: usize },
+    Thumb { path: PathBuf },
 }
 
 impl Job {
-    fn is_image(&self) -> bool {
+    fn is_full(&self) -> bool {
         matches!(self, Job::Full { .. })
+    }
+
+    fn is_thumb(&self) -> bool {
+        matches!(self, Job::Thumb { .. })
     }
 }
 
@@ -46,6 +56,10 @@ pub enum Response {
     Full {
         path: PathBuf,
         result: Result<Decoded, String>,
+    },
+    Thumb {
+        path: PathBuf,
+        result: Result<ColorImage, String>,
     },
 }
 
@@ -101,9 +115,14 @@ impl Queue {
         }
     }
 
-    /// Retire les requêtes d'image en attente (elles seront ré-émises).
-    fn clear_images(&self) {
-        self.heap.lock().unwrap().retain(|i| !i.job.is_image());
+    /// Retire les requêtes pleine taille en attente (elles seront ré-émises).
+    fn clear_full(&self) {
+        self.heap.lock().unwrap().retain(|i| !i.job.is_full());
+    }
+
+    /// Retire les requêtes de vignettes en attente.
+    fn clear_thumbs(&self) {
+        self.heap.lock().unwrap().retain(|i| !i.job.is_thumb());
     }
 }
 
@@ -114,6 +133,10 @@ struct Shared {
     /// ensemble est abandonné.
     wanted: RwLock<HashSet<PathBuf>>,
     in_flight: Mutex<HashSet<PathBuf>>,
+    /// Même mécanisme pour les vignettes, avec sa propre génération.
+    thumb_generation: AtomicU64,
+    wanted_thumbs: RwLock<HashSet<PathBuf>>,
+    thumbs_in_flight: Mutex<HashSet<PathBuf>>,
 }
 
 impl Shared {
@@ -135,6 +158,9 @@ impl Loader {
             generation: AtomicU64::new(0),
             wanted: RwLock::new(HashSet::new()),
             in_flight: Mutex::new(HashSet::new()),
+            thumb_generation: AtomicU64::new(0),
+            wanted_thumbs: RwLock::new(HashSet::new()),
+            thumbs_in_flight: Mutex::new(HashSet::new()),
         });
         let (tx, rx) = channel();
         let workers = std::thread::available_parallelism()
@@ -166,7 +192,7 @@ impl Loader {
     ) {
         let generation = self.shared.generation.fetch_add(1, AtomicOrdering::SeqCst) + 1;
         *self.shared.wanted.write().unwrap() = targets.iter().map(|(p, _)| p.clone()).collect();
-        self.shared.queue.clear_images();
+        self.shared.queue.clear_full();
         let in_flight = self.shared.in_flight.lock().unwrap().clone();
         for (path, prio) in targets {
             if is_cached(path) || in_flight.contains(path) {
@@ -178,6 +204,30 @@ impl Loader {
             };
             self.push(*prio, generation, job);
         }
+    }
+
+    /// Redéfinit les vignettes voulues (visibles puis marge) : les requêtes en
+    /// attente sont annulées et ré-émises, celles en cours et voulues continuent.
+    pub fn retarget_thumbs(
+        &mut self,
+        targets: &[(PathBuf, Priority)],
+        is_cached: impl Fn(&Path) -> bool,
+    ) {
+        let generation = self.shared.thumb_generation.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+        *self.shared.wanted_thumbs.write().unwrap() =
+            targets.iter().map(|(p, _)| p.clone()).collect();
+        self.shared.queue.clear_thumbs();
+        let in_flight = self.shared.thumbs_in_flight.lock().unwrap().clone();
+        for (path, prio) in targets {
+            if is_cached(path) || in_flight.contains(path) {
+                continue;
+            }
+            self.push(*prio, generation, Job::Thumb { path: path.clone() });
+        }
+    }
+
+    pub fn is_thumb_wanted(&self, path: &Path) -> bool {
+        self.shared.wanted_thumbs.read().unwrap().contains(path)
     }
 
     /// Une réponse d'image est utile si son chemin est encore voulu.
@@ -200,6 +250,18 @@ fn worker(shared: &Shared, tx: &Sender<Response>, ctx: &Context) {
     loop {
         let item = shared.queue.pop_blocking();
         let response = match item.job {
+            Job::Thumb { path } => {
+                let wanted = |p: &Path| shared.wanted_thumbs.read().unwrap().contains(p);
+                if item.generation != shared.thumb_generation.load(AtomicOrdering::SeqCst)
+                    || !wanted(&path)
+                {
+                    continue;
+                }
+                shared.thumbs_in_flight.lock().unwrap().insert(path.clone());
+                let result = thumbs::load(&path);
+                shared.thumbs_in_flight.lock().unwrap().remove(&path);
+                wanted(&path).then_some(Response::Thumb { path, result })
+            }
             Job::Dir { epoch, id, path } => {
                 let entries = read_dir(&path);
                 Some(Response::Dir { epoch, id, entries })
@@ -375,7 +437,7 @@ mod tests {
                 path: PathBuf::new(),
             },
         });
-        q.clear_images();
+        q.clear_full();
         let heap = q.heap.lock().unwrap();
         assert_eq!(heap.len(), 1);
         assert!(matches!(heap.peek().unwrap().job, Job::Dir { .. }));

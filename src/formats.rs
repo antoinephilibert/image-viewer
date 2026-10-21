@@ -35,6 +35,16 @@ pub struct Decoded {
 /// Décode une image raster, applique l'orientation EXIF et la réduit si un
 /// côté dépasse `max_side` (limite de texture du GPU).
 pub fn decode(path: &Path, max_side: usize) -> Result<Decoded, String> {
+    let (rgba, original_size) = decode_rgba(path, max_side)?;
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    Ok(Decoded {
+        pixels: ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
+        original_size,
+    })
+}
+
+/// Comme [`decode`], mais renvoie les pixels RGBA non prémultipliés.
+pub fn decode_rgba(path: &Path, max_side: usize) -> Result<(RgbaImage, [usize; 2]), String> {
     let reader = ImageReader::open(path)
         .map_err(|e| e.to_string())?
         .with_guessed_format()
@@ -53,12 +63,7 @@ pub fn decode(path: &Path, max_side: usize) -> Result<Decoded, String> {
         let h = ((original_size[1] as f64 * ratio) as u32).max(1);
         rgba = resize_rgba(rgba, w, h)?;
     }
-
-    let size = [rgba.width() as usize, rgba.height() as usize];
-    Ok(Decoded {
-        pixels: ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
-        original_size,
-    })
+    Ok((rgba, original_size))
 }
 
 /// Réduction SIMD (`fast_image_resize`), alpha géré par la bibliothèque.

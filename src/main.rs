@@ -1,6 +1,7 @@
 mod app;
 mod formats;
 mod loader;
+mod thumbs;
 mod tree;
 mod viewer;
 

@@ -1,16 +1,17 @@
 //! État de l'application et boucle egui.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
 use eframe::egui::{
     self, CentralPanel, Color32, Context, Key, Modifiers, Panel, Rect, ScrollArea, Sense,
-    TextureHandle, TextureOptions, Vec2, pos2, vec2,
+    TextureFilter, TextureHandle, TextureOptions, Vec2, pos2, vec2,
 };
 
 use crate::formats;
 use crate::loader::{Loader, Lru, Priority, Response};
+use crate::thumbs::grid_columns;
 use crate::tree::{NodeId, Tree};
 use crate::viewer::{KEY_STEP, View};
 
@@ -21,6 +22,26 @@ const WHEEL_SENSITIVITY: f32 = 0.0015;
 const BG_IMAGE: Color32 = Color32::from_rgb(24, 24, 27);
 const BG_PANEL: Color32 = Color32::from_rgb(32, 32, 36);
 const SELECTION: Color32 = Color32::from_rgb(56, 98, 168);
+
+/// Largeur visée d'une cellule de la grille, en points.
+const TARGET_CELL: f32 = 110.0;
+/// Budget du cache de textures de vignettes, en octets.
+const THUMB_CACHE_BYTES: usize = 192 * 1024 * 1024;
+/// Lignes de vignettes demandées au-delà de la zone visible.
+const THUMB_MARGIN_ROWS: usize = 2;
+
+/// Mipmaps : réduction de qualité nettement meilleure quand l'image est affichée
+/// bien plus petite que sa texture.
+const TEXTURE_OPTIONS: TextureOptions = TextureOptions {
+    mipmap_mode: Some(TextureFilter::Linear),
+    ..TextureOptions::LINEAR
+};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Tree,
+    Thumbs,
+}
 
 /// Taille de la fenêtre de textures pleine taille : courante + voisines n±2.
 const FULL_CACHE_SLOTS: usize = 5;
@@ -46,6 +67,15 @@ pub struct App {
     cache: Lru<PathBuf, Cached>,
     failed: HashMap<PathBuf, String>,
     display: Option<Display>,
+    mode: Mode,
+    thumbs: Lru<PathBuf, TextureHandle>,
+    thumbs_failed: HashSet<PathBuf>,
+    /// Dernière requête de vignettes émise : (dossier, plage d'indices visibles).
+    thumb_key: Option<(NodeId, (usize, usize))>,
+    thumbs_dirty: bool,
+    /// Plage d'indices d'images visibles dans la grille au dernier cadre.
+    thumb_range: (usize, usize),
+    grid_cols: usize,
     view: View,
     view_cmd: Option<ViewCmd>,
     fullscreen: bool,
@@ -73,6 +103,13 @@ impl App {
             cache: Lru::new(FULL_CACHE_SLOTS),
             failed: HashMap::new(),
             display: None,
+            mode: Mode::Tree,
+            thumbs: Lru::new(THUMB_CACHE_BYTES),
+            thumbs_failed: HashSet::new(),
+            thumb_key: None,
+            thumbs_dirty: false,
+            thumb_range: (0, 0),
+            grid_cols: 1,
             view: View::default(),
             view_cmd: None,
             fullscreen: false,
@@ -109,6 +146,7 @@ impl App {
                     }
                 }
                 Response::Full { path, result } => self.on_full(path, result),
+                Response::Thumb { path, result } => self.on_thumb(path, result),
             }
         }
     }
@@ -116,6 +154,7 @@ impl App {
     fn on_dir_loaded(&mut self, id: NodeId, entries: Vec<crate::tree::Entry>) {
         self.tree.set_children(id, entries);
         self.retarget_needed = true;
+        self.thumbs_dirty = true;
         if let Some(target) = &self.pending_select {
             let found = self.tree.nodes[id]
                 .children
@@ -140,7 +179,7 @@ impl App {
                 let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 let texture =
                     self.ctx
-                        .load_texture(path.to_string_lossy(), d.pixels, TextureOptions::LINEAR);
+                        .load_texture(path.to_string_lossy(), d.pixels, TEXTURE_OPTIONS);
                 let cached = Cached {
                     texture,
                     original_size: d.original_size,
@@ -150,6 +189,25 @@ impl App {
             }
             Err(e) => {
                 self.failed.insert(path, e);
+            }
+        }
+    }
+
+    /// Une texture de vignette n'est créée que si elle est encore voulue.
+    fn on_thumb(&mut self, path: PathBuf, result: Result<egui::ColorImage, String>) {
+        if !self.loader.is_thumb_wanted(&path) || self.thumbs.contains(&path) {
+            return;
+        }
+        match result {
+            Ok(img) => {
+                let weight = img.size[0] * img.size[1] * 4;
+                let tex = self
+                    .ctx
+                    .load_texture(path.to_string_lossy(), img, TEXTURE_OPTIONS);
+                self.thumbs.put(path, tex, weight);
+            }
+            Err(_) => {
+                self.thumbs_failed.insert(path);
             }
         }
     }
@@ -172,6 +230,7 @@ impl App {
         self.display = None;
         self.retarget_needed = true;
         self.pending_select = Some(old);
+        self.thumbs_dirty = true;
         self.request_dir(Tree::ROOT);
     }
 
@@ -191,23 +250,22 @@ impl App {
         !n.is_dir && formats::kind_of(&n.path).is_some()
     }
 
-    /// Images du dossier de la sélection, dans l'ordre d'affichage.
+    /// Dossier courant : dossier sélectionné, ou dossier de l'image sélectionnée.
+    fn current_folder(&self) -> NodeId {
+        match self.selected {
+            Some(s) if self.tree.nodes[s].is_dir => s,
+            Some(s) => self.tree.nodes[s].parent.unwrap_or(Tree::ROOT),
+            None => Tree::ROOT,
+        }
+    }
+
+    /// Images du dossier courant, dans l'ordre d'affichage.
     fn folder_images(&self) -> Vec<NodeId> {
-        let Some(sel) = self.selected else { return vec![] };
-        let folder = if self.tree.nodes[sel].is_dir {
-            Some(sel)
-        } else {
-            self.tree.nodes[sel].parent
-        };
-        folder
-            .map(|f| {
-                self.tree
-                    .visible_children(f, self.show_hidden)
-                    .into_iter()
-                    .filter(|&c| self.is_image(c))
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.tree
+            .visible_children(self.current_folder(), self.show_hidden)
+            .into_iter()
+            .filter(|&c| self.is_image(c))
+            .collect()
     }
 
     fn step_image(&mut self, delta: isize) {
@@ -240,6 +298,7 @@ impl App {
             action.dot = i.consume_key(Modifiers::NONE, Key::Period);
             action.refresh = i.consume_key(Modifiers::NONE, Key::F5);
             action.quit = i.consume_key(Modifiers::NONE, Key::Q);
+            action.tab = i.consume_key(Modifiers::NONE, Key::Tab);
             action.escape = i.consume_key(Modifiers::NONE, Key::Escape);
             action.fullscreen = i.consume_key(Modifiers::NONE, Key::F11);
             if i.consume_key(Modifiers::NONE, Key::F) {
@@ -267,9 +326,17 @@ impl App {
         } else if action.quit || action.escape {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        if action.tab {
+            self.mode = match self.mode {
+                Mode::Tree => Mode::Thumbs,
+                Mode::Thumbs => Mode::Tree,
+            };
+            self.scroll_to_selected = true;
+        }
         if action.dot {
             self.show_hidden = !self.show_hidden;
             self.retarget_needed = true;
+            self.thumbs_dirty = true;
         }
         if action.back {
             self.go_up();
@@ -283,6 +350,10 @@ impl App {
         }
         if action.prev_image {
             self.step_image(-1);
+        }
+        if self.mode == Mode::Thumbs {
+            self.grid_keys(&action);
+            return;
         }
         if action.down {
             let next = match pos {
@@ -325,13 +396,38 @@ impl App {
         }
     }
 
+    /// Flèches dans la grille : gauche/droite d'une vignette, haut/bas d'une ligne.
+    fn grid_keys(&mut self, action: &Keys) {
+        let imgs = self.folder_images();
+        if imgs.is_empty() {
+            return;
+        }
+        let cols = self.grid_cols.max(1);
+        let cur = self.selected.and_then(|s| imgs.iter().position(|&i| i == s));
+        let last = imgs.len() - 1;
+        let next = match cur {
+            None if action.left || action.right || action.up || action.down => 0,
+            None => return,
+            Some(i) if action.right => (i + 1).min(last),
+            Some(i) if action.left => i.saturating_sub(1),
+            Some(i) if action.down => {
+                if i + cols <= last {
+                    i + cols
+                } else if i / cols < last / cols {
+                    last
+                } else {
+                    i
+                }
+            }
+            Some(i) if action.up => i.saturating_sub(cols),
+            Some(_) => return,
+        };
+        self.select(Some(imgs[next]));
+    }
+
     /// F5 : relit le dossier de la sélection (ou la racine).
     fn refresh_current_folder(&mut self) {
-        let folder = match self.selected {
-            Some(s) if self.tree.nodes[s].is_dir => s,
-            Some(s) => self.tree.nodes[s].parent.unwrap_or(Tree::ROOT),
-            None => Tree::ROOT,
-        };
+        let folder = self.current_folder();
         // Les enfants existants deviennent orphelins dans l'arène : acceptable
         // à cette étape, l'arbre est reconstruit à chaque re-racinage.
         self.tree.nodes[folder].children = None;
@@ -339,6 +435,9 @@ impl App {
         self.display = None;
         self.cache.clear();
         self.failed.clear();
+        self.thumbs.clear();
+        self.thumbs_failed.clear();
+        self.thumbs_dirty = true;
         self.retarget_needed = true;
         self.request_dir(folder);
     }
@@ -410,29 +509,73 @@ impl App {
         // Sinon on garde l'image précédente à l'écran jusqu'à l'arrivée de la nouvelle.
     }
 
+    /// Émet les requêtes de vignettes pour la zone visible (plus une marge).
+    fn sync_thumbs(&mut self) {
+        let key = (self.mode == Mode::Thumbs).then(|| (self.current_folder(), self.thumb_range));
+        if key == self.thumb_key && !self.thumbs_dirty {
+            return;
+        }
+        self.thumbs_dirty = false;
+        self.thumb_key = key;
+        let mut targets = Vec::new();
+        if let Some((folder, (first, end))) = key {
+            if self.tree.nodes[folder].children.is_none() {
+                // Dossier jamais lu (sélectionné sans être déplié) : on le charge.
+                self.request_dir(folder);
+            }
+            let imgs = self.folder_images();
+            let margin = self.grid_cols * THUMB_MARGIN_ROWS;
+            let lo = first.saturating_sub(margin);
+            let hi = (end + margin).min(imgs.len());
+            for (i, &id) in imgs.iter().enumerate().take(hi).skip(lo) {
+                let prio = if (first..end).contains(&i) {
+                    Priority::Thumb
+                } else {
+                    Priority::Rest
+                };
+                targets.push((self.tree.nodes[id].path.clone(), prio));
+            }
+        }
+        let (thumbs, failed) = (&mut self.thumbs, &self.thumbs_failed);
+        // `get` rafraîchit le LRU pour les vignettes déjà prêtes.
+        let ready: HashSet<PathBuf> = targets
+            .iter()
+            .filter(|(p, _)| thumbs.get(p).is_some() || failed.contains(p))
+            .map(|(p, _)| p.clone())
+            .collect();
+        self.loader
+            .retarget_thumbs(&targets, |p| ready.contains(p));
+    }
+
+    /// Applique un défilement pour rendre visible la ligne `row` si demandé.
+    fn reveal(&mut self, mut area: ScrollArea, row: Option<usize>, row_h: f32) -> ScrollArea {
+        if std::mem::take(&mut self.scroll_to_selected)
+            && let Some(row) = row
+        {
+            let top = row as f32 * row_h;
+            let bottom = top + row_h;
+            if top < self.scroll_offset {
+                area = area.vertical_scroll_offset(top);
+            } else if bottom > self.scroll_offset + self.viewport_height {
+                area = area.vertical_scroll_offset(bottom - self.viewport_height);
+            }
+        }
+        area
+    }
+
     fn tree_panel(&mut self, ui: &mut egui::Ui) {
         let rows = self.tree.visible_rows(self.show_hidden);
         let has_parent = self.tree.nodes[Tree::ROOT].path.parent().is_some();
         let up_rows = usize::from(has_parent);
         let total = rows.len() + up_rows;
 
-        let mut area = ScrollArea::vertical().auto_shrink([false, false]);
-        if self.scroll_to_selected {
-            if let Some(idx) = self
-                .selected
-                .and_then(|s| rows.iter().position(|&r| r == s))
-                .map(|p| p + up_rows)
-            {
-                let top = idx as f32 * ROW_HEIGHT;
-                let bottom = top + ROW_HEIGHT;
-                if top < self.scroll_offset {
-                    area = area.vertical_scroll_offset(top);
-                } else if bottom > self.scroll_offset + self.viewport_height {
-                    area = area.vertical_scroll_offset(bottom - self.viewport_height);
-                }
-            }
-            self.scroll_to_selected = false;
-        }
+        // Pas d'espacement entre lignes : le calcul de défilement repose sur ROW_HEIGHT.
+        ui.spacing_mut().item_spacing = Vec2::ZERO;
+        let sel_row = self
+            .selected
+            .and_then(|s| rows.iter().position(|&r| r == s))
+            .map(|p| p + up_rows);
+        let area = self.reveal(ScrollArea::vertical().auto_shrink([false, false]), sel_row, ROW_HEIGHT);
 
         let mut clicked: Option<Click> = None;
         let out = area.show_rows(ui, ROW_HEIGHT, total, |ui, range| {
@@ -477,6 +620,96 @@ impl App {
             Some(Click::Select(id)) => self.select(Some(id)),
             Some(Click::Toggle(id)) => self.toggle(id),
             None => {}
+        }
+    }
+
+    fn thumbs_panel(&mut self, ui: &mut egui::Ui) {
+        let folder = self.current_folder();
+        ui.label(
+            egui::RichText::new(&self.tree.nodes[folder].name)
+                .strong()
+                .color(Color32::LIGHT_GRAY),
+        );
+        ui.add_space(4.0);
+        ui.spacing_mut().item_spacing = Vec2::ZERO;
+
+        let imgs = self.folder_images();
+        let cols = grid_columns(ui.available_width(), TARGET_CELL);
+        let cell = (ui.available_width() / cols as f32).floor();
+        self.grid_cols = cols;
+        let total_rows = imgs.len().div_ceil(cols);
+        let sel_row = self
+            .selected
+            .and_then(|s| imgs.iter().position(|&i| i == s))
+            .map(|i| i / cols);
+        let area = ScrollArea::vertical()
+            .id_salt(("grid", folder))
+            .auto_shrink([false, false]);
+        let area = self.reveal(area, sel_row, cell);
+
+        let mut clicked = None;
+        let mut visible = (0, 0);
+        let out = area.show_rows(ui, cell, total_rows, |ui, rows| {
+            visible = (rows.start * cols, (rows.end * cols).min(imgs.len()));
+            for row in rows {
+                let (row_rect, _) =
+                    ui.allocate_exact_size(vec2(cell * cols as f32, cell), Sense::hover());
+                for col in 0..cols {
+                    let idx = row * cols + col;
+                    let Some(&id) = imgs.get(idx) else { break };
+                    let rect = Rect::from_min_size(
+                        row_rect.min + vec2(col as f32 * cell, 0.0),
+                        vec2(cell, cell),
+                    );
+                    let node = &self.tree.nodes[id];
+                    let resp = ui
+                        .interact(rect, ui.scope_id().with(("cell", idx)), Sense::click())
+                        .on_hover_text(&node.name);
+                    if self.selected == Some(id) {
+                        ui.painter().rect_filled(rect.shrink(2.0), 4.0, SELECTION);
+                    } else if resp.hovered() {
+                        ui.painter()
+                            .rect_filled(rect.shrink(2.0), 4.0, Color32::from_white_alpha(12));
+                    }
+                    let inner = rect.shrink(6.0);
+                    if let Some(tex) = self.thumbs.get(&node.path) {
+                        let size = tex.size_vec2();
+                        let scale = (inner.width() / size.x).min(inner.height() / size.y).min(1.0);
+                        ui.painter().image(
+                            tex.id(),
+                            Rect::from_center_size(inner.center(), size * scale),
+                            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                    } else if self.thumbs_failed.contains(&node.path) {
+                        ui.painter().text(
+                            inner.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "×",
+                            egui::FontId::proportional(18.0),
+                            Color32::DARK_GRAY,
+                        );
+                    } else {
+                        ui.painter().rect_filled(
+                            inner.shrink(inner.width() * 0.12),
+                            3.0,
+                            Color32::from_white_alpha(8),
+                        );
+                    }
+                    if resp.clicked() {
+                        clicked = Some(id);
+                    }
+                }
+            }
+        });
+        self.scroll_offset = out.state.clamped_offset().y;
+        self.viewport_height = out.inner_rect.height();
+        if visible != self.thumb_range {
+            self.thumb_range = visible;
+            ui.ctx().request_repaint();
+        }
+        if clicked.is_some() {
+            self.select(clicked);
         }
     }
 
@@ -606,6 +839,7 @@ impl eframe::App for App {
         self.drain_loaded();
         self.handle_keys(ctx);
         self.sync_images(ctx);
+        self.sync_thumbs();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -623,7 +857,10 @@ impl eframe::App for App {
                 .frame(egui::Frame::new().fill(BG_PANEL).inner_margin(4))
                 .resizable(true)
                 .default_size(280.0)
-                .show(ui, |ui| self.tree_panel(ui));
+                .show(ui, |ui| match self.mode {
+                    Mode::Tree => self.tree_panel(ui),
+                    Mode::Thumbs => self.thumbs_panel(ui),
+                });
         }
         CentralPanel::default()
             .frame(egui::Frame::new().fill(BG_IMAGE))
@@ -643,6 +880,7 @@ struct Keys {
     refresh: bool,
     quit: bool,
     escape: bool,
+    tab: bool,
     fullscreen: bool,
     next_image: bool,
     prev_image: bool,

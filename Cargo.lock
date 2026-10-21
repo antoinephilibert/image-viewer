@@ -2533,6 +2533,7 @@ dependencies = [
  "fast_image_resize",
  "image",
  "md5",
+ "png",
  "resvg",
 ]
 
