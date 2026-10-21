@@ -3,7 +3,7 @@ name = "vu"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "Visionneuse d'images minimaliste et rapide pour Wayland"
+description = "A minimalist, fast image viewer for Wayland"
 
 [dependencies]
 eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "wayland"] }

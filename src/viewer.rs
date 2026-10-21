@@ -1,14 +1,14 @@
-//! Zoom et déplacement de l'image. Tout est exprimé en pixels physiques
-//! (1,0 = un pixel d'image pour un pixel d'écran); l'appelant convertit.
+//! Image zoom and pan. Everything is expressed in physical pixels
+//! (1.0 = one image pixel per screen pixel); the caller converts.
 
 use eframe::egui::Vec2;
 
 pub const MIN_ZOOM: f32 = 0.01;
 pub const MAX_ZOOM: f32 = 64.0;
-/// Facteur appliqué par les touches `+` et `-`.
+/// Factor applied by the `+` and `-` keys.
 pub const KEY_STEP: f32 = 1.25;
 
-/// Zoom d'ajustement : l'image entre dans la zone, sans agrandissement au-delà de 100 %.
+/// Fit zoom: the image fits the area, never enlarged beyond 100 %.
 pub fn fit_zoom(img: Vec2, avail: Vec2) -> f32 {
     if img.x <= 0.0 || img.y <= 0.0 {
         return 1.0;
@@ -18,10 +18,10 @@ pub fn fit_zoom(img: Vec2, avail: Vec2) -> f32 {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct View {
-    /// Mode « ajusté » : zoom et décalage sont recalculés à chaque taille de zone.
+    /// "Fit" mode: zoom and offset are recomputed for each area size.
     fit: bool,
     zoom: f32,
-    /// Décalage du centre de l'image par rapport au centre de la zone.
+    /// Offset of the image centre relative to the area centre.
     offset: Vec2,
 }
 
@@ -56,7 +56,7 @@ impl View {
         *self = Self::default();
     }
 
-    /// Zoom absolu en gardant fixe le point sous `cursor` (relatif au centre de la zone).
+    /// Absolute zoom keeping the point under `cursor` fixed (relative to the area centre).
     pub fn zoom_to(&mut self, img: Vec2, avail: Vec2, cursor: Vec2, new_zoom: f32) {
         let old = self.zoom(img, avail);
         let new = new_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
@@ -71,7 +71,7 @@ impl View {
         self.zoom_to(img, avail, cursor, target);
     }
 
-    /// Bascule entre ajusté et taille réelle (100 %).
+    /// Toggles between fit and actual size (100 %).
     pub fn toggle_actual(&mut self, img: Vec2, avail: Vec2, cursor: Vec2) {
         if !self.fit && (self.zoom - 1.0).abs() < 1e-3 {
             self.set_fit();
@@ -88,7 +88,7 @@ impl View {
         self.clamp(img, avail);
     }
 
-    /// Garde l'image dans la zone : centrée si plus petite, bords atteignables sinon.
+    /// Keeps the image in the area: centred if smaller, edges reachable otherwise.
     pub fn clamp(&mut self, img: Vec2, avail: Vec2) {
         if self.fit {
             return;
@@ -120,7 +120,7 @@ mod tests {
         let (img, avail) = (vec2(4000.0, 3000.0), vec2(1000.0, 800.0));
         let mut v = View::default();
         let cursor = vec2(120.0, -80.0);
-        // Point de l'image sous le curseur, en coordonnées image.
+        // Image point under the cursor, in image coordinates.
         let before = (cursor - v.offset()) / v.zoom(img, avail);
         v.zoom_to(img, avail, cursor, 1.0);
         let after = (cursor - v.offset()) / v.zoom(img, avail);
@@ -145,7 +145,7 @@ mod tests {
         assert_eq!(v.offset(), Vec2::ZERO);
         v.zoom_to(img, avail, Vec2::ZERO, 1.0);
         v.pan(vec2(1e6, 1e6), img, avail);
-        // (2000-500)/2 en x, (1000-500)/2 en y.
+        // (2000-500)/2 in x, (1000-500)/2 in y.
         assert_eq!(v.offset(), vec2(750.0, 250.0));
     }
 

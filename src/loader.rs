@@ -1,8 +1,8 @@
-//! Pool de workers, file de priorités, annulation par génération et caches LRU.
+//! Worker pool, priority queue, cancellation by generation and LRU caches.
 //!
-//! Aucun décodage ni lecture de dossier ne se fait sur le thread UI : l'UI
-//! soumet des requêtes, les workers renvoient des réponses par channel puis
-//! appellent `ctx.request_repaint()`.
+//! No decoding or folder reading happens on the UI thread: the UI submits
+//! requests, the workers send responses back over a channel and then call
+//! `ctx.request_repaint()`.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -18,16 +18,16 @@ use crate::formats::{self, Decoded};
 use crate::thumbs;
 use crate::tree::{Entry, NodeId, sort_entries};
 
-/// Priorité d'une requête; le premier variant passe en premier.
+/// Request priority; the first variant is served first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Priority {
     Dir,
     Current,
     Neighbor1,
     Neighbor2,
-    /// Vignette visible.
+    /// Visible thumbnail.
     Thumb,
-    /// Vignette dans la marge autour de la zone visible.
+    /// Thumbnail in the margin around the visible area.
     Rest,
 }
 
@@ -37,13 +37,13 @@ pub enum Job {
         id: NodeId,
         path: PathBuf,
     },
-    /// `svg_side` : grand côté visé si le fichier est un SVG (ignoré sinon).
+    /// `svg_side`: target longest side if the file is an SVG (ignored otherwise).
     Full {
         path: PathBuf,
         max_side: usize,
         svg_side: usize,
     },
-    /// Re-rastérisation d'un SVG à une nouvelle taille (après un changement de zoom).
+    /// Re-rasterises an SVG at a new size (after a zoom change).
     Svg {
         path: PathBuf,
         side: usize,
@@ -102,8 +102,8 @@ impl PartialOrd for Item {
     }
 }
 impl Ord for Item {
-    /// `BinaryHeap` est un max-heap : le plus prioritaire (puis le plus ancien)
-    /// doit être le plus grand.
+    /// `BinaryHeap` is a max-heap: the highest priority (then the oldest)
+    /// must compare as the greatest.
     fn cmp(&self, other: &Self) -> Ordering {
         other
             .priority
@@ -112,7 +112,7 @@ impl Ord for Item {
     }
 }
 
-/// File de priorités bloquante partagée par les workers.
+/// Blocking priority queue shared by the workers.
 #[derive(Default)]
 struct Queue {
     heap: Mutex<BinaryHeap<Item>>,
@@ -135,12 +135,12 @@ impl Queue {
         }
     }
 
-    /// Retire les requêtes pleine taille en attente (elles seront ré-émises).
+    /// Removes pending full-size requests (they will be re-issued).
     fn clear_full(&self) {
         self.heap.lock().unwrap().retain(|i| !i.job.is_full());
     }
 
-    /// Retire les requêtes de vignettes en attente.
+    /// Removes pending thumbnail requests.
     fn clear_thumbs(&self) {
         self.heap.lock().unwrap().retain(|i| !i.job.is_thumb());
     }
@@ -149,11 +149,11 @@ impl Queue {
 struct Shared {
     queue: Queue,
     generation: AtomicU64,
-    /// Chemins encore voulus : une requête ou un résultat hors de cet
-    /// ensemble est abandonné.
+    /// Paths still wanted: a request or result outside this set is
+    /// dropped.
     wanted: RwLock<HashSet<PathBuf>>,
     in_flight: Mutex<HashSet<PathBuf>>,
-    /// Même mécanisme pour les vignettes, avec sa propre génération.
+    /// Same mechanism for thumbnails, with its own generation.
     thumb_generation: AtomicU64,
     wanted_thumbs: RwLock<HashSet<PathBuf>>,
     thumbs_in_flight: Mutex<HashSet<PathBuf>>,
@@ -201,9 +201,9 @@ impl Loader {
         self.push(Priority::Dir, 0, Job::Dir { epoch, id, path });
     }
 
-    /// Redéfinit les images voulues (nouvelle génération). Les requêtes en
-    /// attente sont ré-émises avec leur nouvelle priorité; celles déjà en
-    /// cours de décodage et toujours voulues continuent sans doublon.
+    /// Redefines the wanted images (new generation). Pending requests are
+    /// re-issued with their new priority; those already being decoded and
+    /// still wanted carry on without duplicates.
     pub fn retarget(
         &mut self,
         targets: &[(PathBuf, Priority)],
@@ -228,8 +228,8 @@ impl Loader {
         }
     }
 
-    /// Redéfinit les vignettes voulues (visibles puis marge) : les requêtes en
-    /// attente sont annulées et ré-émises, celles en cours et voulues continuent.
+    /// Redefines the wanted thumbnails (visible, then margin): pending requests
+    /// are cancelled and re-issued, those in progress and still wanted continue.
     pub fn retarget_thumbs(
         &mut self,
         targets: &[(PathBuf, Priority)],
@@ -256,13 +256,13 @@ impl Loader {
         self.shared.wanted_thumbs.read().unwrap().contains(path)
     }
 
-    /// Demande une nouvelle rastérisation d'un SVG (image courante, priorité maximale).
+    /// Requests a new rasterisation of an SVG (current image, top priority).
     pub fn request_svg(&mut self, path: PathBuf, side: usize) {
         let generation = self.shared.generation.load(AtomicOrdering::SeqCst);
         self.push(Priority::Current, generation, Job::Svg { path, side });
     }
 
-    /// Une réponse d'image est utile si son chemin est encore voulu.
+    /// An image response is useful if its path is still wanted.
     pub fn is_wanted(&self, path: &Path) -> bool {
         self.shared.is_wanted(path)
     }
@@ -314,7 +314,7 @@ fn worker(shared: &Shared, tx: &Sender<Response>, ctx: &Context) {
                 max_side,
                 svg_side,
             } => {
-                // Abandon avant décodage : génération périmée ou image plus voulue.
+                // Abandon before decoding: stale generation or image no longer wanted.
                 if item.generation != shared.generation.load(AtomicOrdering::SeqCst)
                     || !shared.is_wanted(&path)
                 {
@@ -327,7 +327,7 @@ fn worker(shared: &Shared, tx: &Sender<Response>, ctx: &Context) {
                     formats::decode(&path, max_side)
                 };
                 shared.in_flight.lock().unwrap().remove(&path);
-                // Abandon après décodage.
+                // Abandon after decoding.
                 shared
                     .is_wanted(&path)
                     .then_some(Response::Full { path, result })
@@ -342,7 +342,7 @@ fn worker(shared: &Shared, tx: &Sender<Response>, ctx: &Context) {
     }
 }
 
-/// Lit un dossier : ne garde que les dossiers et les images supportées.
+/// Reads a folder, keeping only folders and supported images.
 fn read_dir(path: &Path) -> Vec<Entry> {
     let Ok(rd) = std::fs::read_dir(path) else {
         return vec![];
@@ -351,7 +351,7 @@ fn read_dir(path: &Path) -> Vec<Entry> {
         .filter_map(Result::ok)
         .filter_map(|e| {
             let path = e.path();
-            // `fs::metadata` suit les liens symboliques.
+            // `fs::metadata` follows symlinks.
             let is_dir = std::fs::metadata(&path).ok()?.is_dir();
             if !is_dir && formats::kind_of(&path).is_none() {
                 return None;
@@ -367,7 +367,7 @@ fn read_dir(path: &Path) -> Vec<Entry> {
     entries
 }
 
-/// Cache LRU borné par un poids (nombre d'éléments ou octets selon l'usage).
+/// LRU cache bounded by a weight (item count or bytes, depending on use).
 pub struct Lru<K, V> {
     map: HashMap<K, Slot<V>>,
     budget: usize,
@@ -412,8 +412,8 @@ impl<K: Hash + Eq + Clone, V> Lru<K, V> {
         })
     }
 
-    /// Insère puis évince les moins récemment utilisés jusqu'à respecter le
-    /// budget (l'élément qui vient d'être inséré est toujours conservé).
+    /// Inserts, then evicts the least recently used entries until the budget
+    /// is met (the entry just inserted is always kept).
     pub fn put(&mut self, key: K, value: V, weight: usize) {
         self.tick += 1;
         if let Some(old) = self.map.remove(&key) {

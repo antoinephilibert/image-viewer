@@ -1,11 +1,11 @@
-//! Arbre de dossiers à chargement paresseux et tri naturel.
+//! Lazily loaded folder tree and natural sort order.
 
 use std::cmp::Ordering;
 use std::path::PathBuf;
 
 pub type NodeId = usize;
 
-/// Entrée brute lue sur le disque (produite hors du thread UI).
+/// Raw entry read from disk (produced off the UI thread).
 pub struct Entry {
     pub path: PathBuf,
     pub name: String,
@@ -19,13 +19,13 @@ pub struct Node {
     pub hidden: bool,
     pub depth: usize,
     pub parent: Option<NodeId>,
-    /// `None` tant que le contenu n'a pas été lu.
+    /// `None` until the contents have been read.
     pub children: Option<Vec<NodeId>>,
     pub loading: bool,
     pub expanded: bool,
 }
 
-/// Arbre en arène : les nœuds sont adressés par indice.
+/// Arena tree: nodes are addressed by index.
 pub struct Tree {
     pub nodes: Vec<Node>,
 }
@@ -53,7 +53,7 @@ impl Tree {
         }
     }
 
-    /// Range les entrées lues (déjà triées) comme enfants de `id`.
+    /// Stores the entries read (already sorted) as children of `id`.
     pub fn set_children(&mut self, id: NodeId, entries: Vec<Entry>) {
         let depth = self.nodes[id].depth + 1;
         let mut ids = Vec::with_capacity(entries.len());
@@ -76,7 +76,7 @@ impl Tree {
         node.loading = false;
     }
 
-    /// Enfants de `id` visibles selon le réglage des fichiers cachés.
+    /// Children of `id` that are visible given the hidden-files setting.
     pub fn visible_children(&self, id: NodeId, show_hidden: bool) -> Vec<NodeId> {
         self.nodes[id]
             .children
@@ -87,7 +87,7 @@ impl Tree {
             .collect()
     }
 
-    /// Aplatit l'arbre déplié en liste de lignes, dans l'ordre d'affichage.
+    /// Flattens the expanded tree into a list of rows, in display order.
     pub fn visible_rows(&self, show_hidden: bool) -> Vec<NodeId> {
         let mut rows = Vec::new();
         self.push_rows(Self::ROOT, show_hidden, &mut rows);
@@ -105,7 +105,7 @@ impl Tree {
     }
 }
 
-/// Tri : dossiers d'abord, puis tri naturel insensible à la casse.
+/// Order: folders first, then case-insensitive natural order.
 pub fn sort_entries(entries: &mut [Entry]) {
     entries.sort_by(|a, b| {
         b.is_dir
@@ -114,7 +114,7 @@ pub fn sort_entries(entries: &mut [Entry]) {
     });
 }
 
-/// Tri naturel insensible à la casse : `img2` avant `img10`.
+/// Case-insensitive natural order: `img2` before `img10`.
 pub fn natural_cmp(a: &str, b: &str) -> Ordering {
     let mut a = a.chars().peekable();
     let mut b = b.chars().peekable();

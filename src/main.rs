@@ -27,8 +27,8 @@ fn main() -> eframe::Result {
     )
 }
 
-/// Déduit le dossier racine et l'éventuel fichier à sélectionner.
-/// Un simple test de métadonnées : aucun décodage avant l'ouverture de la fenêtre.
+/// Works out the root folder and the file to select, if any.
+/// Only a metadata check: nothing is decoded before the window opens.
 fn resolve_target(arg: Option<PathBuf>) -> (PathBuf, Option<PathBuf>) {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let path = match arg {

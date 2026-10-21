@@ -1,4 +1,4 @@
-//! Détection des formats par extension et décodage des images raster.
+//! Format detection by extension and raster image decoding.
 
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -10,7 +10,7 @@ use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader, RgbaImage};
 use resvg::{tiny_skia, usvg};
 
-/// Famille de format reconnue par extension.
+/// Format family recognised by extension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Raster,
@@ -19,7 +19,7 @@ pub enum Kind {
 
 const RASTER_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"];
 
-/// Renvoie le type de l'image selon l'extension, `None` si non supporté.
+/// Returns the image kind from its extension, `None` if unsupported.
 pub fn kind_of(path: &Path) -> Option<Kind> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     if ext == "svg" {
@@ -31,10 +31,10 @@ pub fn kind_of(path: &Path) -> Option<Kind> {
     }
 }
 
-/// Côté maximal d'une rastérisation SVG (borne la mémoire : 8192² × 4 = 256 Mo).
+/// Maximum side of an SVG rasterisation (bounds memory: 8192² × 4 = 256 MB).
 pub const MAX_SVG_SIDE: usize = 8192;
 
-/// Polices système, chargées une seule fois (opération coûteuse).
+/// System fonts, loaded once (expensive operation).
 fn svg_options() -> usvg::Options<'static> {
     static FONTS: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
     let fonts = FONTS.get_or_init(|| {
@@ -48,8 +48,8 @@ fn svg_options() -> usvg::Options<'static> {
     }
 }
 
-/// Rastérise un SVG pour que son grand côté fasse `side` pixels.
-/// Renvoie le pixmap (alpha prémultiplié) et la taille intrinsèque du SVG.
+/// Rasterises an SVG so that its longest side is `side` pixels.
+/// Returns the pixmap (premultiplied alpha) and the SVG's intrinsic size.
 fn render_svg(path: &Path, side: usize) -> Result<(tiny_skia::Pixmap, [usize; 2]), String> {
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     let tree = usvg::Tree::from_data(&data, &svg_options()).map_err(|e| e.to_string())?;
@@ -59,13 +59,13 @@ fn render_svg(path: &Path, side: usize) -> Result<(tiny_skia::Pixmap, [usize; 2]
         ((w * scale).ceil() as u32).max(1),
         ((h * scale).ceil() as u32).max(1),
     );
-    let mut pixmap = tiny_skia::Pixmap::new(pw, ph).ok_or("taille de rastérisation invalide")?;
+    let mut pixmap = tiny_skia::Pixmap::new(pw, ph).ok_or("invalid rasterisation size")?;
     let transform = tiny_skia::Transform::from_scale(pw as f32 / w, ph as f32 / h);
     resvg::render(&tree, transform, &mut pixmap.as_mut());
     Ok((pixmap, [w.ceil() as usize, h.ceil() as usize]))
 }
 
-/// SVG rastérisé, prêt à devenir une texture.
+/// Rasterised SVG, ready to become a texture.
 pub fn rasterize_svg(path: &Path, side: usize) -> Result<Decoded, String> {
     let (pixmap, original_size) = render_svg(path, side)?;
     let size = [pixmap.width() as usize, pixmap.height() as usize];
@@ -75,7 +75,7 @@ pub fn rasterize_svg(path: &Path, side: usize) -> Result<Decoded, String> {
     })
 }
 
-/// SVG rastérisé en RGBA non prémultiplié (pour les vignettes PNG).
+/// Rasterised SVG as non-premultiplied RGBA (for PNG thumbnails).
 fn rasterize_svg_rgba(path: &Path, side: usize) -> Result<(RgbaImage, [usize; 2]), String> {
     let (pixmap, original_size) = render_svg(path, side)?;
     let mut data = pixmap.data().to_vec();
@@ -88,19 +88,19 @@ fn rasterize_svg_rgba(path: &Path, side: usize) -> Result<(RgbaImage, [usize; 2]
         }
     }
     let img = RgbaImage::from_raw(pixmap.width(), pixmap.height(), data)
-        .ok_or_else(|| "buffer invalide".to_string())?;
+        .ok_or_else(|| "invalid buffer".to_string())?;
     Ok((img, original_size))
 }
 
-/// Image décodée, prête à devenir une texture.
+/// Decoded image, ready to become a texture.
 pub struct Decoded {
     pub pixels: ColorImage,
-    /// Dimensions réelles de l'image (après orientation EXIF, avant réduction).
+    /// Real image dimensions (after EXIF orientation, before downscaling).
     pub original_size: [usize; 2],
 }
 
-/// Décode une image raster, applique l'orientation EXIF et la réduit si un
-/// côté dépasse `max_side` (limite de texture du GPU).
+/// Decodes a raster image, applies the EXIF orientation and downscales it if a
+/// side exceeds `max_side` (GPU texture limit).
 pub fn decode(path: &Path, max_side: usize) -> Result<Decoded, String> {
     let (rgba, original_size) = decode_rgba(path, max_side)?;
     let size = [rgba.width() as usize, rgba.height() as usize];
@@ -110,11 +110,11 @@ pub fn decode(path: &Path, max_side: usize) -> Result<Decoded, String> {
     })
 }
 
-/// Comme [`decode`], mais renvoie les pixels RGBA non prémultipliés.
+/// Like [`decode`], but returns non-premultiplied RGBA pixels.
 ///
-/// Les JPEG passent par `turbojpeg` (décodage réduit par DCT quand l'image est
-/// plus grande que `max_side`); en cas d'échec (CMYK, fichier atypique), on
-/// retombe sur le décodeur générique.
+/// JPEGs go through `turbojpeg` (DCT-scaled decoding when the image is larger
+/// than `max_side`); on failure (CMYK, unusual file) we fall back to the
+/// generic decoder.
 pub fn decode_rgba(path: &Path, max_side: usize) -> Result<(RgbaImage, [usize; 2]), String> {
     if kind_of(path) == Some(Kind::Svg) {
         return rasterize_svg_rgba(path, max_side);
@@ -133,7 +133,7 @@ fn is_jpeg(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("jpeg"))
 }
 
-/// Facteur de réduction DCT le plus fort qui garde le grand côté >= `max_side`.
+/// Strongest DCT scaling factor that keeps the longest side >= `max_side`.
 fn jpeg_scaling(width: usize, height: usize, max_side: usize) -> turbojpeg::ScalingFactor {
     let largest = width.max(height);
     turbojpeg::Decompressor::supported_scaling_factors()
@@ -155,7 +155,7 @@ fn swaps_axes(o: Orientation) -> bool {
 
 fn decode_jpeg(path: &Path, max_side: usize) -> Result<(RgbaImage, [usize; 2]), String> {
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
-    // Lecture de l'en-tête seule : l'orientation EXIF n'exige pas de décoder les pixels.
+    // Header only: the EXIF orientation does not require decoding the pixels.
     let orientation = ImageReader::new(std::io::Cursor::new(&data))
         .with_guessed_format()
         .map_err(|e| e.to_string())?
@@ -188,9 +188,9 @@ fn decode_jpeg(path: &Path, max_side: usize) -> Result<(RgbaImage, [usize; 2]), 
     dec.decompress(&data, image.as_deref_mut())
         .map_err(|e| e.to_string())?;
     let mut rgba = RgbaImage::from_raw(w as u32, h as u32, image.pixels)
-        .ok_or_else(|| "buffer invalide".to_string())?;
+        .ok_or_else(|| "invalid buffer".to_string())?;
 
-    // La réduction DCT s'arrête à un multiple de 1/8 : on finit à la taille exacte.
+    // DCT scaling stops at a multiple of 1/8: finish at the exact size.
     if w.max(h) > max_side {
         let ratio = max_side as f64 / w.max(h) as f64;
         let nw = ((w as f64 * ratio) as u32).max(1);
@@ -227,7 +227,7 @@ pub(crate) fn decode_generic(
     Ok((rgba, original_size))
 }
 
-/// Réduction SIMD (`fast_image_resize`), alpha géré par la bibliothèque.
+/// SIMD downscale (`fast_image_resize`), alpha handled by the library.
 pub fn resize_rgba(src: RgbaImage, width: u32, height: u32) -> Result<RgbaImage, String> {
     let (sw, sh) = (src.width(), src.height());
     let src = FirImage::from_vec_u8(sw, sh, src.into_raw(), PixelType::U8x4)
@@ -237,7 +237,7 @@ pub fn resize_rgba(src: RgbaImage, width: u32, height: u32) -> Result<RgbaImage,
     Resizer::new()
         .resize(&src, &mut dst, &options)
         .map_err(|e| e.to_string())?;
-    RgbaImage::from_raw(width, height, dst.into_vec()).ok_or_else(|| "buffer invalide".to_string())
+    RgbaImage::from_raw(width, height, dst.into_vec()).ok_or_else(|| "invalid buffer".to_string())
 }
 
 #[cfg(test)]
@@ -254,19 +254,19 @@ mod tests {
 
     #[test]
     fn jpeg_scaling_keeps_largest_side_above_target() {
-        // 5472 px, cible 256 : 1/8 donne 684 >= 256, c'est le plus fort facteur.
+        // 5472 px, target 256: 1/8 gives 684 >= 256, the strongest factor.
         let f = jpeg_scaling(5472, 3648, 256);
         assert_eq!((f.num(), f.denom()), (1, 8));
-        // Cible proche de la taille native : pas de réduction possible.
+        // Target close to the native size: no downscaling possible.
         let f = jpeg_scaling(1000, 800, 1000);
         assert_eq!(f.scale(1000), 1000);
-        // Cible 700 sur 5472 : 1/8 (684) est trop petit, on prend 3/16-ish >= 700.
+        // Target 700 on 5472: 1/8 (684) is too small, so pick a factor >= 700.
         let f = jpeg_scaling(5472, 3648, 700);
         assert!(f.scale(5472) >= 700 && f.scale(5472) < 5472);
     }
 
-    /// Le chemin turbojpeg et le décodeur générique doivent donner la même image,
-    /// y compris l'orientation EXIF (ici 6 = rotation de 90°).
+    /// The turbojpeg path and the generic decoder must give the same image,
+    /// EXIF orientation included (here 6 = 90° rotation).
     #[test]
     fn turbojpeg_matches_generic_decoder_with_exif_rotation() {
         use image::ImageEncoder;
@@ -274,7 +274,7 @@ mod tests {
         let img = image::RgbImage::from_fn(w, h, |x, y| {
             image::Rgb([(x * 4) as u8, (y * 8) as u8, ((x + y) * 3) as u8])
         });
-        // TIFF little-endian minimal avec uniquement le tag Orientation = 6.
+        // Minimal little-endian TIFF containing only the Orientation = 6 tag.
         let exif: Vec<u8> = vec![
             0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x12, 0x01, 0x03, 0x00,
             0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -304,7 +304,7 @@ mod tests {
             .map(|(a, b)| u64::from(a.abs_diff(*b)))
             .sum();
         let mean = diff as f64 / fast.as_raw().len() as f64;
-        assert!(mean < 3.0, "écart moyen {mean}");
+        assert!(mean < 3.0, "mean difference {mean}");
     }
 
     #[test]

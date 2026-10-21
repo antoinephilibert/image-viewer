@@ -1,4 +1,4 @@
-//! État de l'application et boucle egui.
+//! Application state and egui loop.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -18,30 +18,30 @@ use crate::viewer::{KEY_STEP, View};
 
 const ROW_HEIGHT: f32 = 22.0;
 const INDENT: f32 = 14.0;
-/// Sensibilité de la molette : exposant appliqué au défilement en points.
+/// Mouse wheel sensitivity: exponent applied to the scroll amount in points.
 const WHEEL_SENSITIVITY: f32 = 0.0015;
 const BG_IMAGE: Color32 = Color32::from_rgb(24, 24, 27);
 const BG_PANEL: Color32 = Color32::from_rgb(32, 32, 36);
 const SELECTION: Color32 = Color32::from_rgb(56, 98, 168);
-/// Filets discrets entre les zones.
+/// Subtle dividers between areas.
 const DIVIDER: Color32 = Color32::from_rgb(44, 44, 51);
 const TEXT_DIM: Color32 = Color32::from_rgb(128, 128, 138);
 const TEXT_NORMAL: Color32 = Color32::from_rgb(205, 205, 212);
 const FOLDER_TEXT: Color32 = Color32::from_rgb(226, 196, 130);
 
-/// Largeur visée d'une cellule de la grille, en points.
+/// Target width of a grid cell, in points.
 const TARGET_CELL: f32 = 110.0;
-/// Budget du cache de textures de vignettes, en octets.
+/// Thumbnail texture cache budget, in bytes.
 const THUMB_CACHE_BYTES: usize = 192 * 1024 * 1024;
-/// Lignes de vignettes demandées au-delà de la zone visible.
+/// Rows of thumbnails requested beyond the visible area.
 const THUMB_MARGIN_ROWS: usize = 2;
-/// Pas d'arrondi de la taille de rastérisation SVG (évite de re-rastériser à chaque cran de molette).
+/// Rounding step for the SVG rasterisation size (avoids re-rasterising on every wheel notch).
 const SVG_BUCKET: usize = 512;
-/// Délai sans changement de zoom avant de re-rastériser un SVG.
+/// Delay without zoom change before re-rasterising an SVG.
 const SVG_DEBOUNCE: Duration = Duration::from_millis(150);
 
-/// Mipmaps : réduction de qualité nettement meilleure quand l'image est affichée
-/// bien plus petite que sa texture.
+/// Mipmaps: much better downscaling quality when the image is displayed
+/// far smaller than its texture.
 const TEXTURE_OPTIONS: TextureOptions = TextureOptions {
     mipmap_mode: Some(TextureFilter::Linear),
     ..TextureOptions::LINEAR
@@ -53,7 +53,7 @@ enum Mode {
     Thumbs,
 }
 
-/// Taille de la fenêtre de textures pleine taille : courante + voisines n±2.
+/// Size of the full-size texture window: current + neighbours n±2.
 const FULL_CACHE_SLOTS: usize = 5;
 
 #[derive(Clone)]
@@ -61,11 +61,11 @@ struct Cached {
     texture: TextureHandle,
     original_size: [usize; 2],
     file_size: u64,
-    /// Grand côté de la texture (pour les SVG : résolution de la rastérisation).
+    /// Longest side of the texture (for SVGs: the rasterisation resolution).
     raster_side: usize,
 }
 
-/// Image actuellement affichée (ou son erreur).
+/// Image currently displayed (or its error).
 struct Display {
     path: PathBuf,
     item: Result<Cached, String>,
@@ -80,26 +80,26 @@ pub struct App {
     failed: HashMap<PathBuf, String>,
     display: Option<Display>,
     mode: Mode,
-    /// Re-rastérisation SVG en attente de stabilisation du zoom.
+    /// SVG re-rasterisation waiting for the zoom to settle.
     svg_pending: Option<(PathBuf, usize, Instant)>,
     svg_inflight: Option<(PathBuf, usize)>,
     thumbs: Lru<PathBuf, TextureHandle>,
     thumbs_failed: HashSet<PathBuf>,
-    /// Dernière requête de vignettes émise : (dossier, plage d'indices visibles).
+    /// Last thumbnail request issued: (folder, range of visible indices).
     thumb_key: Option<(NodeId, (usize, usize))>,
     thumbs_dirty: bool,
-    /// Plage d'indices d'images visibles dans la grille au dernier cadre.
+    /// Range of image indices visible in the grid in the last frame.
     thumb_range: (usize, usize),
     grid_cols: usize,
     view: View,
     view_cmd: Option<ViewCmd>,
     fullscreen: bool,
-    /// Taille (en points) de la zone image au dernier cadre.
+    /// Size (in points) of the image area in the last frame.
     last_avail: Vec2,
     retarget_needed: bool,
     max_side: usize,
     selected: Option<NodeId>,
-    /// Chemin à sélectionner une fois son dossier lu.
+    /// Path to select once its folder has been read.
     pending_select: Option<PathBuf>,
     show_hidden: bool,
     scroll_to_selected: bool,
@@ -144,7 +144,7 @@ impl App {
         app
     }
 
-    /// Demande la lecture d'un dossier au loader (hors thread UI).
+    /// Asks the loader to read a folder (off the UI thread).
     fn request_dir(&mut self, id: NodeId) {
         let node = &mut self.tree.nodes[id];
         if node.children.is_some() || node.loading {
@@ -187,7 +187,7 @@ impl App {
         }
     }
 
-    /// Une texture n'est créée que si l'image est encore voulue.
+    /// A texture is only created if the image is still wanted.
     fn on_full(&mut self, path: PathBuf, result: Result<formats::Decoded, String>) {
         if !self.loader.is_wanted(&path) || self.cache.contains(&path) {
             return;
@@ -217,7 +217,7 @@ impl App {
         }
     }
 
-    /// Nouvelle rastérisation d'un SVG : remplace la texture en cache et affichée.
+    /// New SVG rasterisation: replaces the cached and displayed texture.
     fn on_svg(&mut self, path: PathBuf, result: Result<formats::Decoded, String>) {
         self.svg_inflight = None;
         if !self.loader.is_wanted(&path) {
@@ -232,7 +232,7 @@ impl App {
         }
     }
 
-    /// Grand côté de rastérisation initial d'un SVG : la zone d'affichage, arrondie.
+    /// Initial rasterisation side of an SVG: the display area, rounded up.
     fn svg_hint(&self) -> usize {
         let ppp = self.ctx.pixels_per_point();
         let side = (self.last_avail.x.max(self.last_avail.y) * ppp).ceil() as usize;
@@ -240,7 +240,7 @@ impl App {
         (side.div_ceil(SVG_BUCKET) * SVG_BUCKET).min(self.max_side.min(MAX_SVG_SIDE))
     }
 
-    /// Re-rastérise le SVG affiché si le zoom l'exige, une fois le zoom stabilisé.
+    /// Re-rasterises the displayed SVG if the zoom requires it, once the zoom has settled.
     fn sync_svg(&mut self, path: &Path, img: Vec2, zoom: f32, current_side: usize) {
         if formats::kind_of(path) != Some(Kind::Svg) {
             return;
@@ -248,7 +248,7 @@ impl App {
         let needed = (img.x.max(img.y) * zoom).ceil() as usize;
         let want =
             (needed.div_ceil(SVG_BUCKET).max(1) * SVG_BUCKET).min(self.max_side.min(MAX_SVG_SIDE));
-        // Agrandir dès que la texture est trop petite; ne réduire que d'un facteur >= 4.
+        // Enlarge as soon as the texture is too small; only shrink by a factor >= 4.
         let stale = want > current_side || want * 4 < current_side;
         let inflight = self
             .svg_inflight
@@ -276,7 +276,7 @@ impl App {
         }
     }
 
-    /// Une texture de vignette n'est créée que si elle est encore voulue.
+    /// A thumbnail texture is only created if it is still wanted.
     fn on_thumb(&mut self, path: PathBuf, result: Result<egui::ColorImage, String>) {
         if !self.loader.is_thumb_wanted(&path) || self.thumbs.contains(&path) {
             return;
@@ -303,7 +303,7 @@ impl App {
         }
     }
 
-    /// Re-racine l'arbre sur le dossier parent.
+    /// Re-roots the tree on the parent folder.
     fn go_up(&mut self) {
         let old = self.tree.nodes[Tree::ROOT].path.clone();
         let Some(parent) = old.parent() else { return };
@@ -333,7 +333,7 @@ impl App {
         !n.is_dir && formats::kind_of(&n.path).is_some()
     }
 
-    /// Dossier courant : dossier sélectionné, ou dossier de l'image sélectionnée.
+    /// Current folder: the selected folder, or the folder of the selected image.
     fn current_folder(&self) -> NodeId {
         match self.selected {
             Some(s) if self.tree.nodes[s].is_dir => s,
@@ -342,7 +342,7 @@ impl App {
         }
     }
 
-    /// Images du dossier courant, dans l'ordre d'affichage.
+    /// Images of the current folder, in display order.
     fn folder_images(&self) -> Vec<NodeId> {
         self.tree
             .visible_children(self.current_folder(), self.show_hidden)
@@ -483,7 +483,7 @@ impl App {
         }
     }
 
-    /// Flèches dans la grille : gauche/droite d'une vignette, haut/bas d'une ligne.
+    /// Arrow keys in the grid: left/right by one thumbnail, up/down by one row.
     fn grid_keys(&mut self, action: &Keys) {
         let imgs = self.folder_images();
         if imgs.is_empty() {
@@ -514,11 +514,11 @@ impl App {
         self.select(Some(imgs[next]));
     }
 
-    /// F5 : relit le dossier de la sélection (ou la racine).
+    /// F5: re-reads the selection's folder (or the root).
     fn refresh_current_folder(&mut self) {
         let folder = self.current_folder();
-        // Les enfants existants deviennent orphelins dans l'arène : acceptable
-        // à cette étape, l'arbre est reconstruit à chaque re-racinage.
+        // The existing children become orphans in the arena: acceptable, since
+        // the tree is rebuilt on every re-root.
         self.tree.nodes[folder].children = None;
         self.selected = Some(folder);
         self.display = None;
@@ -531,14 +531,14 @@ impl App {
         self.request_dir(folder);
     }
 
-    /// Chemin de l'image sélectionnée, s'il y en a une.
+    /// Path of the selected image, if there is one.
     fn selected_image_path(&self) -> Option<PathBuf> {
         self.selected
             .filter(|&s| self.is_image(s))
             .map(|s| self.tree.nodes[s].path.clone())
     }
 
-    /// Cibles voulues : image courante, puis voisines n±1 et n±2.
+    /// Wanted targets: current image, then neighbours n±1 and n±2.
     fn targets(&self) -> Vec<(PathBuf, Priority)> {
         let Some(sel) = self.selected.filter(|&s| self.is_image(s)) else {
             return vec![];
@@ -560,12 +560,12 @@ impl App {
         out
     }
 
-    /// Met à jour les requêtes du loader et l'image affichée.
+    /// Updates the loader requests and the displayed image.
     fn sync_images(&mut self, ctx: &Context) {
         self.max_side = ctx.input(|i| i.max_texture_side);
         if std::mem::take(&mut self.retarget_needed) {
             let targets = self.targets();
-            // Garde les voisines déjà prêtes « fraîches » dans le LRU.
+            // Keeps neighbours that are already ready "fresh" in the LRU.
             let ready: Vec<bool> = targets
                 .iter()
                 .map(|(p, _)| self.cache.get(p).is_some() || self.failed.contains_key(p))
@@ -598,10 +598,10 @@ impl App {
         };
         self.display = Some(Display { path, item });
         self.view.set_fit();
-        // Sinon on garde l'image précédente à l'écran jusqu'à l'arrivée de la nouvelle.
+        // Otherwise keep the previous image on screen until the new one arrives.
     }
 
-    /// Émet les requêtes de vignettes pour la zone visible (plus une marge).
+    /// Issues thumbnail requests for the visible area (plus a margin).
     fn sync_thumbs(&mut self) {
         let key = (self.mode == Mode::Thumbs).then(|| (self.current_folder(), self.thumb_range));
         if key == self.thumb_key && !self.thumbs_dirty {
@@ -612,7 +612,7 @@ impl App {
         let mut targets = Vec::new();
         if let Some((folder, (first, end))) = key {
             if self.tree.nodes[folder].children.is_none() {
-                // Dossier jamais lu (sélectionné sans être déplié) : on le charge.
+                // Folder never read (selected without being expanded): load it.
                 self.request_dir(folder);
             }
             let imgs = self.folder_images();
@@ -629,7 +629,7 @@ impl App {
             }
         }
         let (thumbs, failed) = (&mut self.thumbs, &self.thumbs_failed);
-        // `get` rafraîchit le LRU pour les vignettes déjà prêtes.
+        // `get` refreshes the LRU for thumbnails that are already ready.
         let ready: HashSet<PathBuf> = targets
             .iter()
             .filter(|(p, _)| thumbs.get(p).is_some() || failed.contains(p))
@@ -638,7 +638,7 @@ impl App {
         self.loader.retarget_thumbs(&targets, |p| ready.contains(p));
     }
 
-    /// Applique un défilement pour rendre visible la ligne `row` si demandé.
+    /// Scrolls so that row `row` is visible, if requested.
     fn reveal(&mut self, mut area: ScrollArea, row: Option<usize>, row_h: f32) -> ScrollArea {
         if std::mem::take(&mut self.scroll_to_selected)
             && let Some(row) = row
@@ -660,7 +660,7 @@ impl App {
         let up_rows = usize::from(has_parent);
         let total = rows.len() + up_rows;
 
-        // Pas d'espacement entre lignes : le calcul de défilement repose sur ROW_HEIGHT.
+        // No spacing between rows: the scroll computation relies on ROW_HEIGHT.
         ui.spacing_mut().item_spacing = Vec2::ZERO;
         let sel_row = self
             .selected
@@ -829,7 +829,7 @@ impl App {
         }
     }
 
-    /// Texte de la barre d'état : (gauche : fichier, droite : position et zoom).
+    /// Status bar text: (left: file, right: position and zoom).
     fn status_parts(&self) -> (String, String) {
         let Some(d) = &self.display else {
             let folder = self.current_folder();
@@ -874,7 +874,7 @@ impl App {
         let img = Vec2::new(c.original_size[0] as f32, c.original_size[1] as f32);
         let avail = self.last_avail;
         let z = self.view.zoom(img, avail * ppp);
-        let mode = if self.view.is_fit() { " (ajusté)" } else { "" };
+        let mode = if self.view.is_fit() { " (fit)" } else { "" };
         format!("{:.0} %{mode}", z * 100.0)
     }
 
@@ -907,7 +907,7 @@ impl App {
             cached.original_size[1] as f32,
         );
         let avail = rect.size() * ppp;
-        // Position du curseur relative au centre de la zone, en pixels physiques.
+        // Cursor position relative to the area centre, in physical pixels.
         let cursor = resp
             .hover_pos()
             .map_or(Vec2::ZERO, |p| (p - rect.center()) * ppp);
@@ -933,7 +933,7 @@ impl App {
         if resp.double_clicked() {
             self.view.toggle_actual(img, avail, cursor);
         }
-        // La taille de la zone peut avoir changé depuis le dernier cadrage.
+        // The area size may have changed since the last frame.
         self.view.clamp(img, avail);
 
         let zoom = self.view.zoom(img, avail);
@@ -943,7 +943,7 @@ impl App {
         let size = img * zoom / ppp;
         let center = rect.center() + self.view.offset() / ppp;
         let mut img_rect = Rect::from_center_size(center, size);
-        // Aligne sur la grille de pixels physiques pour une netteté parfaite à 100 %.
+        // Snap to the physical pixel grid for perfect sharpness at 100 %.
         let min = pos2(
             (img_rect.min.x * ppp).round() / ppp,
             (img_rect.min.y * ppp).round() / ppp,
@@ -1038,7 +1038,7 @@ struct Keys {
     prev_image: bool,
 }
 
-/// Commande de zoom en attente : appliquée dans `image_panel`, qui connaît la zone.
+/// Pending zoom command: applied in `image_panel`, which knows the area.
 enum ViewCmd {
     Fit,
     Actual,
@@ -1051,7 +1051,7 @@ enum Click {
     Toggle(NodeId),
 }
 
-/// Écran d'accueil : icône d'image estompée et rappel des raccourcis.
+/// Welcome screen: faded image icon and a reminder of the shortcuts.
 fn paint_empty_state(ui: &egui::Ui, rect: Rect) {
     let p = ui.painter();
     let c = rect.center() + vec2(0.0, -24.0);
@@ -1078,25 +1078,25 @@ fn paint_empty_state(ui: &egui::Ui, rect: Rect) {
     p.text(
         c + vec2(0.0, 54.0),
         egui::Align2::CENTER_CENTER,
-        "Sélectionne une image",
+        "Select an image",
         egui::FontId::proportional(15.0),
         Color32::from_rgb(120, 120, 132),
     );
     p.text(
         c + vec2(0.0, 78.0),
         egui::Align2::CENTER_CENTER,
-        "Espace : suivante   Tab : vignettes   F11 : plein écran   q : quitter",
+        "Space: next   Tab: thumbnails   F11: fullscreen   q: quit",
         egui::FontId::proportional(12.0),
         Color32::from_rgb(86, 86, 98),
     );
 }
 
-/// Fond d'une ligne : légèrement en retrait des bords du panneau.
+/// Row background: slightly inset from the panel edges.
 fn row_bg(rect: Rect) -> Rect {
     rect.shrink2(vec2(4.0, 1.0))
 }
 
-/// Libellé tronqué avec « … » plutôt que coupé net au bord du panneau.
+/// Label truncated with "…" rather than cut off at the panel edge.
 fn paint_label(ui: &egui::Ui, rect: Rect, depth: usize, text: &str, color: Color32) {
     let x = rect.left() + 38.0 + depth as f32 * INDENT;
     let max_width = (rect.right() - 10.0 - x).max(0.0);
@@ -1111,7 +1111,7 @@ fn paint_label(ui: &egui::Ui, rect: Rect, depth: usize, text: &str, color: Color
     ui.painter().galley(pos, galley, color);
 }
 
-/// Icône dessinée à la main : dossier (onglet + corps) ou image (cadre + montagne).
+/// Hand-drawn icon: folder (tab + body) or image (frame + mountain).
 fn paint_icon(ui: &egui::Ui, rect: Rect, depth: usize, is_dir: bool, hidden: bool) {
     let c = pos2(rect.left() + 24.0 + depth as f32 * INDENT, rect.center().y);
     let p = ui.painter();
@@ -1149,7 +1149,7 @@ fn paint_icon(ui: &egui::Ui, rect: Rect, depth: usize, is_dir: bool, hidden: boo
     }
 }
 
-/// Thème sombre : surfaces neutres, aucune bordure inutile, coins légèrement arrondis.
+/// Dark theme: neutral surfaces, no needless borders, slightly rounded corners.
 fn apply_theme(ctx: &Context) {
     let mut v = egui::Visuals::dark();
     v.panel_fill = BG_PANEL;
@@ -1195,7 +1195,7 @@ fn paint_chevron(ui: &egui::Ui, rect: Rect, depth: usize, open: bool) {
 }
 
 fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["o", "Ko", "Mo", "Go"];
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut v = bytes as f64;
     let mut u = 0;
     while v >= 1024.0 && u < UNITS.len() - 1 {
@@ -1203,7 +1203,7 @@ fn human_size(bytes: u64) -> String {
         u += 1;
     }
     if u == 0 {
-        format!("{bytes} o")
+        format!("{bytes} B")
     } else {
         format!("{v:.1} {}", UNITS[u])
     }
@@ -1215,8 +1215,8 @@ mod tests {
 
     #[test]
     fn formats_sizes() {
-        assert_eq!(human_size(512), "512 o");
-        assert_eq!(human_size(2048), "2.0 Ko");
-        assert_eq!(human_size(20 * 1024 * 1024), "20.0 Mo");
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(2048), "2.0 KB");
+        assert_eq!(human_size(20 * 1024 * 1024), "20.0 MB");
     }
 }

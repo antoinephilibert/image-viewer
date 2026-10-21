@@ -1,9 +1,9 @@
-//! Vignettes : cache disque freedesktop (`~/.cache/thumbnails/large/`) et
-//! calcul de la grille.
+//! Thumbnails: freedesktop disk cache (`~/.cache/thumbnails/large/`) and
+//! grid computation.
 //!
 //! Spec : https://specifications.freedesktop.org/thumbnail-spec/latest/
-//! Nom de fichier = MD5 de l'URI `file://` ; PNG de 256 px max avec les
-//! métadonnées `Thumb::URI` et `Thumb::MTime`.
+//! File name = MD5 of the `file://` URI; PNG of at most 256 px with the
+//! `Thumb::URI` and `Thumb::MTime` metadata.
 
 use std::fs;
 use std::io::{BufRead, Seek, Write};
@@ -14,10 +14,10 @@ use eframe::egui::ColorImage;
 
 use crate::formats;
 
-/// Côté maximal des vignettes « large » de la spec.
+/// Maximum side of the spec's "large" thumbnails.
 pub const THUMB_SIZE: usize = 256;
 
-/// URI `file://` avec encodage pourcent (octets non réservés conservés).
+/// `file://` URI with percent-encoding (unreserved bytes kept).
 pub fn file_uri(path: &Path) -> String {
     use std::os::unix::ffi::OsStrExt;
     let mut uri = String::from("file://");
@@ -32,7 +32,7 @@ pub fn file_uri(path: &Path) -> String {
     uri
 }
 
-/// Clé du cache : MD5 hexadécimal de l'URI.
+/// Cache key: hexadecimal MD5 of the URI.
 pub fn cache_key(uri: &str) -> String {
     format!("{:x}", md5::compute(uri.as_bytes()))
 }
@@ -54,14 +54,14 @@ fn mtime_secs(path: &Path) -> Option<u64> {
     Some(modified.duration_since(UNIX_EPOCH).ok()?.as_secs())
 }
 
-/// Métadonnées lues dans le PNG.
+/// Metadata read from the PNG.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Meta {
     pub uri: Option<String>,
     pub mtime: Option<u64>,
 }
 
-/// Encode une vignette RGBA 8 bits (non prémultipliée) avec ses métadonnées.
+/// Encodes an 8-bit RGBA thumbnail (non-premultiplied) with its metadata.
 pub fn encode_png(
     out: impl Write,
     width: u32,
@@ -86,14 +86,14 @@ pub fn encode_png(
     writer.finish().map_err(|e| e.to_string())
 }
 
-/// Décode une vignette PNG (tout type de couleur 8 bits après expansion).
+/// Decodes a PNG thumbnail (any colour type, 8 bits after expansion).
 pub fn decode_png(input: impl BufRead + Seek) -> Result<(Meta, ColorImage), String> {
     let mut dec = png::Decoder::new(input);
     dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = dec.read_info().map_err(|e| e.to_string())?;
-    let mut buf = vec![0; reader.output_buffer_size().ok_or("taille invalide")?];
+    let mut buf = vec![0; reader.output_buffer_size().ok_or("invalid size")?];
     let frame = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
-    // Les blocs texte peuvent suivre les données d'image.
+    // Text chunks may follow the image data.
     reader.finish().map_err(|e| e.to_string())?;
     let (w, h) = (frame.width as usize, frame.height as usize);
     let data = &buf[..frame.buffer_size()];
@@ -113,7 +113,7 @@ pub fn decode_png(input: impl BufRead + Seek) -> Result<(Meta, ColorImage), Stri
             .flat_map(|p| [p[0], p[0], p[0], p[1]])
             .collect(),
         png::ColorType::Grayscale => data.iter().flat_map(|&g| [g, g, g, 255]).collect(),
-        png::ColorType::Indexed => return Err("PNG indexé non étendu".into()),
+        png::ColorType::Indexed => return Err("indexed PNG was not expanded".into()),
     };
 
     let info = reader.info();
@@ -137,16 +137,16 @@ pub fn decode_png(input: impl BufRead + Seek) -> Result<(Meta, ColorImage), Stri
     Ok((meta, ColorImage::from_rgba_unmultiplied([w, h], &rgba)))
 }
 
-/// Une vignette est à jour si URI et date de modification correspondent.
+/// A thumbnail is fresh if its URI and modification time match.
 pub fn is_fresh(meta: &Meta, uri: &str, mtime: u64) -> bool {
     meta.uri.as_deref() == Some(uri) && meta.mtime == Some(mtime)
 }
 
-/// Charge la vignette d'une image : lue sur disque si à jour, sinon générée
-/// puis écrite dans le cache partagé.
+/// Loads an image's thumbnail: read from disk if fresh, otherwise generated
+/// and written to the shared cache.
 pub fn load(path: &Path) -> Result<ColorImage, String> {
     let uri = file_uri(path);
-    let mtime = mtime_secs(path).ok_or("date de modification illisible")?;
+    let mtime = mtime_secs(path).ok_or("unreadable modification time")?;
     let cached = cache_path(&uri);
 
     if let Some(file) = cached.as_ref().and_then(|p| fs::File::open(p).ok())
@@ -158,7 +158,7 @@ pub fn load(path: &Path) -> Result<ColorImage, String> {
 
     let (rgba, _) = formats::decode_rgba(path, THUMB_SIZE)?;
     if let Some(dest) = cached {
-        // Échec d'écriture sans gravité : la vignette reste utilisable.
+        // A write failure is harmless: the thumbnail is still usable.
         let _ = store(
             &dest,
             rgba.width(),
@@ -172,10 +172,10 @@ pub fn load(path: &Path) -> Result<ColorImage, String> {
     Ok(ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
 }
 
-/// Écriture atomique (fichier temporaire puis renommage), dossiers en 0700.
+/// Atomic write (temporary file, then rename), folders created as 0700.
 fn store(dest: &Path, w: u32, h: u32, rgba: &[u8], uri: &str, mtime: u64) -> Result<(), String> {
     use std::os::unix::fs::DirBuilderExt;
-    let dir = dest.parent().ok_or("chemin invalide")?;
+    let dir = dest.parent().ok_or("invalid path")?;
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -192,7 +192,7 @@ fn store(dest: &Path, w: u32, h: u32, rgba: &[u8], uri: &str, mtime: u64) -> Res
     result
 }
 
-/// Nombre de colonnes de la grille pour une largeur donnée.
+/// Number of grid columns for a given width.
 pub fn grid_columns(width: f32, target_cell: f32) -> usize {
     ((width / target_cell).floor() as usize).max(1)
 }
@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn key_is_md5_of_uri() {
-        // Valeur de référence obtenue avec `md5sum` sur l'URI (sans retour à la ligne).
+        // Reference value obtained with `md5sum` on the URI (no trailing newline).
         assert_eq!(
             cache_key("file:///home/jens/photo/me.png"),
             "d40775e596682f2a16d1b834c221c0a2"
@@ -239,17 +239,17 @@ mod tests {
         assert_eq!(grid_columns(400.0, 110.0), 3);
     }
 
-    /// Mesure (à lancer à la main) : `VU_BENCH_DIR=<dossier> cargo test --release
-    /// bench_jpeg -- --ignored --nocapture`. Image synthétique de 20 Mpx.
+    /// Manual benchmark: `VU_BENCH_DIR=<folder> cargo test --release
+    /// bench_jpeg -- --ignored --nocapture`. Synthetic 20 Mpx image.
     #[test]
-    #[ignore = "mesure manuelle"]
+    #[ignore = "manual benchmark"]
     fn bench_jpeg_thumbnail_generation() {
         use std::time::Instant;
         let dir = PathBuf::from(std::env::var("VU_BENCH_DIR").expect("VU_BENCH_DIR"));
         let path = dir.join("bench-20mp.jpg");
         let (w, h) = (5472u32, 3648u32);
         let img = image::RgbImage::from_fn(w, h, |x, y| {
-            // Dégradé + bruit déterministe pour une entropie proche d'une photo.
+            // Gradient + deterministic noise for photo-like entropy.
             let n = (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)) >> 24;
             image::Rgb([
                 ((x * 255 / w) as u8).wrapping_add(n as u8 / 8),
@@ -262,19 +262,19 @@ mod tests {
             .encode_image(&img)
             .unwrap();
         println!(
-            "fichier : {} Mo",
+            "file: {} MB",
             fs::metadata(&path).unwrap().len() / 1_000_000
         );
 
         for _ in 0..3 {
-            // Chemin générique : décodage complet puis réduction.
+            // Generic path: full decode, then downscale.
             let t = Instant::now();
             let (full, _) = formats::decode_generic(&path, usize::MAX).unwrap();
             let t_full = t.elapsed();
             let t = Instant::now();
             let small = formats::resize_rgba(full, 256, 171).unwrap();
             let t_resize = t.elapsed();
-            // Chemin turbojpeg : décodage réduit par DCT.
+            // turbojpeg path: DCT-scaled decode.
             let t = Instant::now();
             let (fast, _) = formats::decode_rgba(&path, THUMB_SIZE).unwrap();
             let t_turbo = t.elapsed();
@@ -283,7 +283,7 @@ mod tests {
             encode_png(&mut out, 256, 171, small.as_raw(), "file:///x", 1).unwrap();
             let t_png = t.elapsed();
             println!(
-                "générique : décodage {t_full:?} + réduction {t_resize:?} = {:?} | turbojpeg : {t_turbo:?} ({}x{}) | écriture PNG {t_png:?}",
+                "generic: decode {t_full:?} + resize {t_resize:?} = {:?} | turbojpeg: {t_turbo:?} ({}x{}) | PNG write {t_png:?}",
                 t_full + t_resize,
                 fast.width(),
                 fast.height()
