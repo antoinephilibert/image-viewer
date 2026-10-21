@@ -12,9 +12,12 @@ use eframe::egui::{
 use crate::formats;
 use crate::loader::{Loader, Lru, Priority, Response};
 use crate::tree::{NodeId, Tree};
+use crate::viewer::{KEY_STEP, View};
 
 const ROW_HEIGHT: f32 = 22.0;
 const INDENT: f32 = 14.0;
+/// Sensibilité de la molette : exposant appliqué au défilement en points.
+const WHEEL_SENSITIVITY: f32 = 0.0015;
 const BG_IMAGE: Color32 = Color32::from_rgb(24, 24, 27);
 const BG_PANEL: Color32 = Color32::from_rgb(32, 32, 36);
 const SELECTION: Color32 = Color32::from_rgb(56, 98, 168);
@@ -43,6 +46,11 @@ pub struct App {
     cache: Lru<PathBuf, Cached>,
     failed: HashMap<PathBuf, String>,
     display: Option<Display>,
+    view: View,
+    view_cmd: Option<ViewCmd>,
+    fullscreen: bool,
+    /// Taille (en points) de la zone image au dernier cadre.
+    last_avail: Vec2,
     retarget_needed: bool,
     max_side: usize,
     selected: Option<NodeId>,
@@ -65,6 +73,10 @@ impl App {
             cache: Lru::new(FULL_CACHE_SLOTS),
             failed: HashMap::new(),
             display: None,
+            view: View::default(),
+            view_cmd: None,
+            fullscreen: false,
+            last_avail: Vec2::ZERO,
             retarget_needed: false,
             max_side: 4096,
             selected: None,
@@ -227,11 +239,32 @@ impl App {
             action.back = i.consume_key(Modifiers::NONE, Key::Backspace);
             action.dot = i.consume_key(Modifiers::NONE, Key::Period);
             action.refresh = i.consume_key(Modifiers::NONE, Key::F5);
-            action.quit = i.consume_key(Modifiers::NONE, Key::Q)
-                || i.consume_key(Modifiers::NONE, Key::Escape);
+            action.quit = i.consume_key(Modifiers::NONE, Key::Q);
+            action.escape = i.consume_key(Modifiers::NONE, Key::Escape);
+            action.fullscreen = i.consume_key(Modifiers::NONE, Key::F11);
+            if i.consume_key(Modifiers::NONE, Key::F) {
+                self.view_cmd = Some(ViewCmd::Fit);
+            } else if i.consume_key(Modifiers::NONE, Key::Num1) {
+                self.view_cmd = Some(ViewCmd::Actual);
+            } else if i.consume_key(Modifiers::NONE, Key::Plus)
+                || i.consume_key(Modifiers::SHIFT, Key::Plus)
+                || i.consume_key(Modifiers::NONE, Key::Equals)
+                || i.consume_key(Modifiers::SHIFT, Key::Equals)
+            {
+                self.view_cmd = Some(ViewCmd::Zoom(KEY_STEP));
+            } else if i.consume_key(Modifiers::NONE, Key::Minus) {
+                self.view_cmd = Some(ViewCmd::Zoom(1.0 / KEY_STEP));
+            }
         });
 
-        if action.quit {
+        if action.fullscreen {
+            self.fullscreen = !self.fullscreen;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
+        if action.escape && self.fullscreen {
+            self.fullscreen = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        } else if action.quit || action.escape {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         if action.dot {
@@ -365,17 +398,15 @@ impl App {
         if self.display.as_ref().is_some_and(|d| d.path == path) {
             return;
         }
-        if let Some(c) = self.cache.get(&path) {
-            self.display = Some(Display {
-                path,
-                item: Ok(c.clone()),
-            });
+        let item = if let Some(c) = self.cache.get(&path) {
+            Ok(c.clone())
         } else if let Some(e) = self.failed.get(&path) {
-            self.display = Some(Display {
-                path,
-                item: Err(e.clone()),
-            });
-        }
+            Err(e.clone())
+        } else {
+            return;
+        };
+        self.display = Some(Display { path, item });
+        self.view.set_fit();
         // Sinon on garde l'image précédente à l'écran jusqu'à l'arrivée de la nouvelle.
     }
 
@@ -472,18 +503,33 @@ impl App {
         match &d.item {
             Ok(c) => {
                 let [w, h] = c.original_size;
-                format!("{name}   {w}×{h}   {}   {pos}{loading}", human_size(c.file_size))
+                format!(
+                    "{name}   {w}×{h}   {}   {pos}   {}{loading}",
+                    human_size(c.file_size),
+                    self.zoom_label(c),
+                )
             }
             Err(_) => format!("{name}   {pos}{loading}"),
         }
     }
 
-    fn image_panel(&self, ui: &mut egui::Ui) {
+    fn zoom_label(&self, c: &Cached) -> String {
+        let ppp = self.ctx.pixels_per_point();
+        let img = Vec2::new(c.original_size[0] as f32, c.original_size[1] as f32);
+        let avail = self.last_avail;
+        let z = self.view.zoom(img, avail * ppp);
+        let mode = if self.view.is_fit() { " (ajusté)" } else { "" };
+        format!("{:.0} %{mode}", z * 100.0)
+    }
+
+    fn image_panel(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
         ui.painter().rect_filled(rect, 0.0, BG_IMAGE);
+        self.last_avail = rect.size();
+        let resp = ui.allocate_rect(rect, Sense::click_and_drag());
         let Some(display) = &self.display else { return };
         let cached = match &display.item {
-            Ok(c) => c,
+            Ok(c) => c.clone(),
             Err(err) => {
                 ui.painter().text(
                     rect.center(),
@@ -495,12 +541,58 @@ impl App {
                 return;
             }
         };
-        let [ow, oh] = cached.original_size;
-        let avail = rect.size();
-        let scale = (avail.x / ow as f32).min(avail.y / oh as f32).min(1.0);
-        let size = Vec2::new(ow as f32 * scale, oh as f32 * scale);
-        let img_rect = Rect::from_center_size(rect.center(), size);
-        ui.painter().image(
+
+        let ppp = ui.ctx().pixels_per_point();
+        let img = Vec2::new(cached.original_size[0] as f32, cached.original_size[1] as f32);
+        let avail = rect.size() * ppp;
+        // Position du curseur relative au centre de la zone, en pixels physiques.
+        let cursor = resp
+            .hover_pos()
+            .map_or(Vec2::ZERO, |p| (p - rect.center()) * ppp);
+
+        match self.view_cmd.take() {
+            Some(ViewCmd::Fit) => self.view.set_fit(),
+            Some(ViewCmd::Actual) => self.view.zoom_to(img, avail, Vec2::ZERO, 1.0),
+            Some(ViewCmd::Zoom(f)) => self.view.zoom_by(img, avail, Vec2::ZERO, f),
+            None => {}
+        }
+        if resp.hovered() {
+            let (scroll, pinch) = ui
+                .ctx()
+                .input(|i| (i.smooth_scroll_delta().y, i.zoom_delta()));
+            let factor = pinch * (scroll * WHEEL_SENSITIVITY).exp();
+            if (factor - 1.0).abs() > f32::EPSILON {
+                self.view.zoom_by(img, avail, cursor, factor);
+            }
+        }
+        if resp.dragged() {
+            self.view.pan(resp.drag_delta() * ppp, img, avail);
+        }
+        if resp.double_clicked() {
+            self.view.toggle_actual(img, avail, cursor);
+        }
+        // La taille de la zone peut avoir changé depuis le dernier cadrage.
+        self.view.clamp(img, avail);
+
+        let zoom = self.view.zoom(img, avail);
+        let size = img * zoom / ppp;
+        let center = rect.center() + self.view.offset() / ppp;
+        let mut img_rect = Rect::from_center_size(center, size);
+        // Aligne sur la grille de pixels physiques pour une netteté parfaite à 100 %.
+        let min = pos2(
+            (img_rect.min.x * ppp).round() / ppp,
+            (img_rect.min.y * ppp).round() / ppp,
+        );
+        img_rect = Rect::from_min_size(min, size);
+        if !self.view.is_fit() && (img * zoom).max_elem() > avail.min_elem() {
+            let icon = if resp.dragged() {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Grab
+            };
+            ui.ctx().set_cursor_icon(icon);
+        }
+        ui.painter().with_clip_rect(rect).image(
             cached.texture.id(),
             img_rect,
             Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
@@ -517,21 +609,22 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let panel_frame = egui::Frame::new()
-            .fill(BG_PANEL)
-            .inner_margin(egui::Margin::symmetric(8, 6));
-
-        Panel::bottom("status")
-            .frame(panel_frame)
-            .exact_size(26.0)
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new(self.status_text()).color(Color32::GRAY));
-            });
-        Panel::left("tree")
-            .frame(egui::Frame::new().fill(BG_PANEL).inner_margin(4))
-            .resizable(true)
-            .default_size(280.0)
-            .show(ui, |ui| self.tree_panel(ui));
+        if !self.fullscreen {
+            let panel_frame = egui::Frame::new()
+                .fill(BG_PANEL)
+                .inner_margin(egui::Margin::symmetric(8, 6));
+            Panel::bottom("status")
+                .frame(panel_frame)
+                .exact_size(26.0)
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new(self.status_text()).color(Color32::GRAY));
+                });
+            Panel::left("tree")
+                .frame(egui::Frame::new().fill(BG_PANEL).inner_margin(4))
+                .resizable(true)
+                .default_size(280.0)
+                .show(ui, |ui| self.tree_panel(ui));
+        }
         CentralPanel::default()
             .frame(egui::Frame::new().fill(BG_IMAGE))
             .show(ui, |ui| self.image_panel(ui));
@@ -549,8 +642,17 @@ struct Keys {
     dot: bool,
     refresh: bool,
     quit: bool,
+    escape: bool,
+    fullscreen: bool,
     next_image: bool,
     prev_image: bool,
+}
+
+/// Commande de zoom en attente : appliquée dans `image_panel`, qui connaît la zone.
+enum ViewCmd {
+    Fit,
+    Actual,
+    Zoom(f32),
 }
 
 enum Click {

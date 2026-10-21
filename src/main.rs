@@ -2,6 +2,7 @@ mod app;
 mod formats;
 mod loader;
 mod tree;
+mod viewer;
 
 use std::path::PathBuf;
 
