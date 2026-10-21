@@ -1,29 +1,95 @@
 //! Détection des formats par extension et décodage des images raster.
 
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use eframe::egui::ColorImage;
 use fast_image_resize::images::Image as FirImage;
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader, RgbaImage};
+use resvg::{tiny_skia, usvg};
 
 /// Famille de format reconnue par extension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Raster,
+    Svg,
 }
 
-const RASTER_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff",
-];
+const RASTER_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"];
 
 /// Renvoie le type de l'image selon l'extension, `None` si non supporté.
 pub fn kind_of(path: &Path) -> Option<Kind> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    RASTER_EXTENSIONS
-        .contains(&ext.as_str())
-        .then_some(Kind::Raster)
+    if ext == "svg" {
+        Some(Kind::Svg)
+    } else if RASTER_EXTENSIONS.contains(&ext.as_str()) {
+        Some(Kind::Raster)
+    } else {
+        None
+    }
+}
+
+/// Côté maximal d'une rastérisation SVG (borne la mémoire : 8192² × 4 = 256 Mo).
+pub const MAX_SVG_SIDE: usize = 8192;
+
+/// Polices système, chargées une seule fois (opération coûteuse).
+fn svg_options() -> usvg::Options<'static> {
+    static FONTS: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
+    let fonts = FONTS.get_or_init(|| {
+        let mut db = usvg::fontdb::Database::new();
+        db.load_system_fonts();
+        Arc::new(db)
+    });
+    usvg::Options {
+        fontdb: fonts.clone(),
+        ..usvg::Options::default()
+    }
+}
+
+/// Rastérise un SVG pour que son grand côté fasse `side` pixels.
+/// Renvoie le pixmap (alpha prémultiplié) et la taille intrinsèque du SVG.
+fn render_svg(path: &Path, side: usize) -> Result<(tiny_skia::Pixmap, [usize; 2]), String> {
+    let data = std::fs::read(path).map_err(|e| e.to_string())?;
+    let tree = usvg::Tree::from_data(&data, &svg_options()).map_err(|e| e.to_string())?;
+    let (w, h) = (tree.size().width(), tree.size().height());
+    let scale = side.clamp(1, MAX_SVG_SIDE) as f32 / w.max(h);
+    let (pw, ph) = (
+        ((w * scale).ceil() as u32).max(1),
+        ((h * scale).ceil() as u32).max(1),
+    );
+    let mut pixmap = tiny_skia::Pixmap::new(pw, ph).ok_or("taille de rastérisation invalide")?;
+    let transform = tiny_skia::Transform::from_scale(pw as f32 / w, ph as f32 / h);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    Ok((pixmap, [w.ceil() as usize, h.ceil() as usize]))
+}
+
+/// SVG rastérisé, prêt à devenir une texture.
+pub fn rasterize_svg(path: &Path, side: usize) -> Result<Decoded, String> {
+    let (pixmap, original_size) = render_svg(path, side)?;
+    let size = [pixmap.width() as usize, pixmap.height() as usize];
+    Ok(Decoded {
+        pixels: ColorImage::from_rgba_premultiplied(size, pixmap.data()),
+        original_size,
+    })
+}
+
+/// SVG rastérisé en RGBA non prémultiplié (pour les vignettes PNG).
+fn rasterize_svg_rgba(path: &Path, side: usize) -> Result<(RgbaImage, [usize; 2]), String> {
+    let (pixmap, original_size) = render_svg(path, side)?;
+    let mut data = pixmap.data().to_vec();
+    for px in data.as_chunks_mut::<4>().0 {
+        let a = u32::from(px[3]);
+        if a != 0 && a != 255 {
+            for c in &mut px[..3] {
+                *c = ((u32::from(*c) * 255 + a / 2) / a).min(255) as u8;
+            }
+        }
+    }
+    let img = RgbaImage::from_raw(pixmap.width(), pixmap.height(), data)
+        .ok_or_else(|| "buffer invalide".to_string())?;
+    Ok((img, original_size))
 }
 
 /// Image décodée, prête à devenir une texture.
@@ -50,6 +116,9 @@ pub fn decode(path: &Path, max_side: usize) -> Result<Decoded, String> {
 /// plus grande que `max_side`); en cas d'échec (CMYK, fichier atypique), on
 /// retombe sur le décodeur générique.
 pub fn decode_rgba(path: &Path, max_side: usize) -> Result<(RgbaImage, [usize; 2]), String> {
+    if kind_of(path) == Some(Kind::Svg) {
+        return rasterize_svg_rgba(path, max_side);
+    }
     if is_jpeg(path)
         && let Ok(decoded) = decode_jpeg(path, max_side)
     {
@@ -133,7 +202,10 @@ fn decode_jpeg(path: &Path, max_side: usize) -> Result<(RgbaImage, [usize; 2]), 
     Ok((img.into_rgba8(), original_size))
 }
 
-pub(crate) fn decode_generic(path: &Path, max_side: usize) -> Result<(RgbaImage, [usize; 2]), String> {
+pub(crate) fn decode_generic(
+    path: &Path,
+    max_side: usize,
+) -> Result<(RgbaImage, [usize; 2]), String> {
     let reader = ImageReader::open(path)
         .map_err(|e| e.to_string())?
         .with_guessed_format()
@@ -233,6 +305,30 @@ mod tests {
             .sum();
         let mean = diff as f64 / fast.as_raw().len() as f64;
         assert!(mean < 3.0, "écart moyen {mean}");
+    }
+
+    #[test]
+    fn svg_rasterizes_at_requested_side() {
+        let dir = std::env::temp_dir().join(format!("vu-svg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.svg");
+        std::fs::write(
+            &path,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10" fill="#ff0000"/></svg>"##,
+        )
+        .unwrap();
+        let d = rasterize_svg(&path, 40).unwrap();
+        let (img, size) = rasterize_svg_rgba(&path, 40).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(d.original_size, [20, 10]);
+        assert_eq!(d.pixels.size, [40, 20]);
+        assert_eq!(size, [20, 10]);
+        assert_eq!(img.get_pixel(20, 10).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn svg_is_a_supported_kind() {
+        assert_eq!(kind_of(Path::new("logo.SVG")), Some(Kind::Svg));
     }
 
     #[test]

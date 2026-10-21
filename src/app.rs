@@ -2,14 +2,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, CentralPanel, Color32, Context, Key, Modifiers, Panel, Rect, ScrollArea, Sense,
     TextureFilter, TextureHandle, TextureOptions, Vec2, pos2, vec2,
 };
 
-use crate::formats;
+use crate::formats::{self, Kind, MAX_SVG_SIDE};
 use crate::loader::{Loader, Lru, Priority, Response};
 use crate::thumbs::grid_columns;
 use crate::tree::{NodeId, Tree};
@@ -29,6 +30,10 @@ const TARGET_CELL: f32 = 110.0;
 const THUMB_CACHE_BYTES: usize = 192 * 1024 * 1024;
 /// Lignes de vignettes demandées au-delà de la zone visible.
 const THUMB_MARGIN_ROWS: usize = 2;
+/// Pas d'arrondi de la taille de rastérisation SVG (évite de re-rastériser à chaque cran de molette).
+const SVG_BUCKET: usize = 512;
+/// Délai sans changement de zoom avant de re-rastériser un SVG.
+const SVG_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// Mipmaps : réduction de qualité nettement meilleure quand l'image est affichée
 /// bien plus petite que sa texture.
@@ -51,6 +56,8 @@ struct Cached {
     texture: TextureHandle,
     original_size: [usize; 2],
     file_size: u64,
+    /// Grand côté de la texture (pour les SVG : résolution de la rastérisation).
+    raster_side: usize,
 }
 
 /// Image actuellement affichée (ou son erreur).
@@ -68,6 +75,9 @@ pub struct App {
     failed: HashMap<PathBuf, String>,
     display: Option<Display>,
     mode: Mode,
+    /// Re-rastérisation SVG en attente de stabilisation du zoom.
+    svg_pending: Option<(PathBuf, usize, Instant)>,
+    svg_inflight: Option<(PathBuf, usize)>,
     thumbs: Lru<PathBuf, TextureHandle>,
     thumbs_failed: HashSet<PathBuf>,
     /// Dernière requête de vignettes émise : (dossier, plage d'indices visibles).
@@ -94,7 +104,7 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, root: PathBuf, select: Option<PathBuf>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        apply_theme(&cc.egui_ctx);
         let mut app = Self {
             tree: Tree::new(root),
             epoch: 0,
@@ -104,6 +114,8 @@ impl App {
             failed: HashMap::new(),
             display: None,
             mode: Mode::Tree,
+            svg_pending: None,
+            svg_inflight: None,
             thumbs: Lru::new(THUMB_CACHE_BYTES),
             thumbs_failed: HashSet::new(),
             thumb_key: None,
@@ -146,6 +158,7 @@ impl App {
                     }
                 }
                 Response::Full { path, result } => self.on_full(path, result),
+                Response::Svg { path, result } => self.on_svg(path, result),
                 Response::Thumb { path, result } => self.on_thumb(path, result),
             }
         }
@@ -176,19 +189,84 @@ impl App {
         }
         match result {
             Ok(d) => {
-                let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                let texture =
-                    self.ctx
-                        .load_texture(path.to_string_lossy(), d.pixels, TEXTURE_OPTIONS);
-                let cached = Cached {
-                    texture,
-                    original_size: d.original_size,
-                    file_size,
-                };
+                let cached = self.make_cached(&path, d);
                 self.cache.put(path, cached, 1);
             }
             Err(e) => {
                 self.failed.insert(path, e);
+            }
+        }
+    }
+
+    fn make_cached(&self, path: &Path, d: formats::Decoded) -> Cached {
+        let file_size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let raster_side = d.pixels.size[0].max(d.pixels.size[1]);
+        let texture = self
+            .ctx
+            .load_texture(path.to_string_lossy(), d.pixels, TEXTURE_OPTIONS);
+        Cached {
+            texture,
+            original_size: d.original_size,
+            file_size,
+            raster_side,
+        }
+    }
+
+    /// Nouvelle rastérisation d'un SVG : remplace la texture en cache et affichée.
+    fn on_svg(&mut self, path: PathBuf, result: Result<formats::Decoded, String>) {
+        self.svg_inflight = None;
+        if !self.loader.is_wanted(&path) {
+            return;
+        }
+        if let Ok(d) = result {
+            let cached = self.make_cached(&path, d);
+            if let Some(display) = self.display.as_mut().filter(|d| d.path == path) {
+                display.item = Ok(cached.clone());
+            }
+            self.cache.put(path, cached, 1);
+        }
+    }
+
+    /// Grand côté de rastérisation initial d'un SVG : la zone d'affichage, arrondie.
+    fn svg_hint(&self) -> usize {
+        let ppp = self.ctx.pixels_per_point();
+        let side = (self.last_avail.x.max(self.last_avail.y) * ppp).ceil() as usize;
+        let side = if side == 0 { 2048 } else { side };
+        (side.div_ceil(SVG_BUCKET) * SVG_BUCKET).min(self.max_side.min(MAX_SVG_SIDE))
+    }
+
+    /// Re-rastérise le SVG affiché si le zoom l'exige, une fois le zoom stabilisé.
+    fn sync_svg(&mut self, path: &Path, img: Vec2, zoom: f32, current_side: usize) {
+        if formats::kind_of(path) != Some(Kind::Svg) {
+            return;
+        }
+        let needed = (img.x.max(img.y) * zoom).ceil() as usize;
+        let want =
+            (needed.div_ceil(SVG_BUCKET).max(1) * SVG_BUCKET).min(self.max_side.min(MAX_SVG_SIDE));
+        // Agrandir dès que la texture est trop petite; ne réduire que d'un facteur >= 4.
+        let stale = want > current_side || want * 4 < current_side;
+        let inflight = self
+            .svg_inflight
+            .as_ref()
+            .is_some_and(|(p, w)| p == path && *w == want);
+        if !stale || inflight {
+            self.svg_pending = None;
+            return;
+        }
+        match &self.svg_pending {
+            Some((p, w, since)) if p == path && *w == want => {
+                let elapsed = since.elapsed();
+                if elapsed >= SVG_DEBOUNCE {
+                    self.loader.request_svg(path.to_path_buf(), want);
+                    self.svg_inflight = Some((path.to_path_buf(), want));
+                    self.svg_pending = None;
+                } else {
+                    self.ctx.request_repaint_after(SVG_DEBOUNCE - elapsed);
+                }
+            }
+            _ => {
+                self.svg_pending = Some((path.to_path_buf(), want, Instant::now()));
+                self.ctx.request_repaint_after(SVG_DEBOUNCE);
             }
         }
     }
@@ -273,7 +351,9 @@ impl App {
         if imgs.is_empty() {
             return;
         }
-        let cur = self.selected.and_then(|s| imgs.iter().position(|&i| i == s));
+        let cur = self
+            .selected
+            .and_then(|s| imgs.iter().position(|&i| i == s));
         let next = match cur {
             Some(i) => (i as isize + delta).clamp(0, imgs.len() as isize - 1) as usize,
             None if delta > 0 => 0,
@@ -284,7 +364,9 @@ impl App {
 
     fn handle_keys(&mut self, ctx: &Context) {
         let rows = self.tree.visible_rows(self.show_hidden);
-        let pos = self.selected.and_then(|s| rows.iter().position(|&r| r == s));
+        let pos = self
+            .selected
+            .and_then(|s| rows.iter().position(|&r| r == s));
         let mut action = Keys::default();
         ctx.input_mut(|i| {
             action.prev_image = i.consume_key(Modifiers::SHIFT, Key::Space);
@@ -403,7 +485,9 @@ impl App {
             return;
         }
         let cols = self.grid_cols.max(1);
-        let cur = self.selected.and_then(|s| imgs.iter().position(|&i| i == s));
+        let cur = self
+            .selected
+            .and_then(|s| imgs.iter().position(|&i| i == s));
         let last = imgs.len() - 1;
         let next = match cur {
             None if action.left || action.right || action.up || action.down => 0,
@@ -487,8 +571,11 @@ impl App {
                 .filter(|(_, r)| **r)
                 .map(|((p, _), _)| p)
                 .collect();
+            let svg_hint = self.svg_hint();
             self.loader
-                .retarget(&targets, self.max_side, |p| known.contains(&p.to_path_buf()));
+                .retarget(&targets, self.max_side, svg_hint, |p| {
+                    known.contains(&p.to_path_buf())
+                });
         }
         let Some(path) = self.selected_image_path() else {
             self.display = None;
@@ -543,8 +630,7 @@ impl App {
             .filter(|(p, _)| thumbs.get(p).is_some() || failed.contains(p))
             .map(|(p, _)| p.clone())
             .collect();
-        self.loader
-            .retarget_thumbs(&targets, |p| ready.contains(p));
+        self.loader.retarget_thumbs(&targets, |p| ready.contains(p));
     }
 
     /// Applique un défilement pour rendre visible la ligne `row` si demandé.
@@ -575,7 +661,11 @@ impl App {
             .selected
             .and_then(|s| rows.iter().position(|&r| r == s))
             .map(|p| p + up_rows);
-        let area = self.reveal(ScrollArea::vertical().auto_shrink([false, false]), sel_row, ROW_HEIGHT);
+        let area = self.reveal(
+            ScrollArea::vertical().auto_shrink([false, false]),
+            sel_row,
+            ROW_HEIGHT,
+        );
 
         let mut clicked: Option<Click> = None;
         let out = area.show_rows(ui, ROW_HEIGHT, total, |ui, range| {
@@ -597,6 +687,7 @@ impl App {
                 if node.is_dir {
                     paint_chevron(ui, rect, node.depth, node.expanded);
                 }
+                paint_icon(ui, rect, node.depth, node.is_dir, node.hidden);
                 let color = if node.is_dir {
                     Color32::from_rgb(230, 200, 130)
                 } else if node.hidden {
@@ -668,13 +759,18 @@ impl App {
                     if self.selected == Some(id) {
                         ui.painter().rect_filled(rect.shrink(2.0), 4.0, SELECTION);
                     } else if resp.hovered() {
-                        ui.painter()
-                            .rect_filled(rect.shrink(2.0), 4.0, Color32::from_white_alpha(12));
+                        ui.painter().rect_filled(
+                            rect.shrink(2.0),
+                            4.0,
+                            Color32::from_white_alpha(12),
+                        );
                     }
                     let inner = rect.shrink(6.0);
                     if let Some(tex) = self.thumbs.get(&node.path) {
                         let size = tex.size_vec2();
-                        let scale = (inner.width() / size.x).min(inner.height() / size.y).min(1.0);
+                        let scale = (inner.width() / size.x)
+                            .min(inner.height() / size.y)
+                            .min(1.0);
                         ui.painter().image(
                             tex.id(),
                             Rect::from_center_size(inner.center(), size * scale),
@@ -776,7 +872,10 @@ impl App {
         };
 
         let ppp = ui.ctx().pixels_per_point();
-        let img = Vec2::new(cached.original_size[0] as f32, cached.original_size[1] as f32);
+        let img = Vec2::new(
+            cached.original_size[0] as f32,
+            cached.original_size[1] as f32,
+        );
         let avail = rect.size() * ppp;
         // Position du curseur relative au centre de la zone, en pixels physiques.
         let cursor = resp
@@ -808,6 +907,9 @@ impl App {
         self.view.clamp(img, avail);
 
         let zoom = self.view.zoom(img, avail);
+        if let Some(path) = self.display.as_ref().map(|d| d.path.clone()) {
+            self.sync_svg(&path, img, zoom, cached.raster_side);
+        }
         let size = img * zoom / ppp;
         let center = rect.center() + self.view.offset() / ppp;
         let mut img_rect = Rect::from_center_size(center, size);
@@ -900,7 +1002,7 @@ enum Click {
 }
 
 fn paint_label(ui: &egui::Ui, rect: Rect, depth: usize, text: &str, color: Color32) {
-    let x = rect.left() + 18.0 + depth as f32 * INDENT;
+    let x = rect.left() + 38.0 + depth as f32 * INDENT;
     ui.painter().text(
         pos2(x, rect.center().y),
         egui::Align2::LEFT_CENTER,
@@ -910,12 +1012,81 @@ fn paint_label(ui: &egui::Ui, rect: Rect, depth: usize, text: &str, color: Color
     );
 }
 
+/// Icône dessinée à la main : dossier (onglet + corps) ou image (cadre + montagne).
+fn paint_icon(ui: &egui::Ui, rect: Rect, depth: usize, is_dir: bool, hidden: bool) {
+    let c = pos2(rect.left() + 24.0 + depth as f32 * INDENT, rect.center().y);
+    let p = ui.painter();
+    if is_dir {
+        let color = Color32::from_rgb(214, 178, 96);
+        p.rect_filled(
+            Rect::from_min_size(c + vec2(-6.0, -5.0), vec2(5.0, 3.0)),
+            1.0,
+            color,
+        );
+        p.rect_filled(
+            Rect::from_min_size(c + vec2(-6.0, -3.0), vec2(12.0, 8.0)),
+            1.5,
+            color,
+        );
+    } else {
+        let color = if hidden {
+            Color32::from_gray(90)
+        } else {
+            Color32::from_rgb(110, 150, 210)
+        };
+        let frame = Rect::from_min_size(c + vec2(-5.5, -5.5), vec2(11.0, 11.0));
+        p.rect_filled(frame, 2.0, color.gamma_multiply(0.35));
+        p.add(egui::Shape::convex_polygon(
+            vec![
+                frame.left_bottom() + vec2(1.0, -1.0),
+                frame.left_bottom() + vec2(4.5, -6.0),
+                frame.left_bottom() + vec2(7.0, -3.0),
+                frame.left_bottom() + vec2(8.5, -4.5),
+                frame.right_bottom() + vec2(-1.0, -1.0),
+            ],
+            color,
+            egui::Stroke::NONE,
+        ));
+    }
+}
+
+/// Thème sombre : surfaces neutres, aucune bordure inutile, coins légèrement arrondis.
+fn apply_theme(ctx: &Context) {
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = BG_PANEL;
+    v.window_fill = BG_PANEL;
+    v.extreme_bg_color = BG_IMAGE;
+    v.window_stroke = egui::Stroke::NONE;
+    v.selection.bg_fill = SELECTION;
+    v.selection.stroke = egui::Stroke::NONE;
+    for w in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.bg_stroke = egui::Stroke::NONE;
+        w.corner_radius = egui::CornerRadius::same(4);
+    }
+    ctx.set_visuals(v);
+    ctx.global_style_mut(|s| s.spacing.scroll = egui::style::ScrollStyle::thin());
+}
+
 fn paint_chevron(ui: &egui::Ui, rect: Rect, depth: usize, open: bool) {
     let c = pos2(rect.left() + 8.0 + depth as f32 * INDENT, rect.center().y);
     let pts = if open {
-        vec![c + vec2(-3.5, -2.0), c + vec2(3.5, -2.0), c + vec2(0.0, 3.0)]
+        vec![
+            c + vec2(-3.5, -2.0),
+            c + vec2(3.5, -2.0),
+            c + vec2(0.0, 3.0),
+        ]
     } else {
-        vec![c + vec2(-2.0, -3.5), c + vec2(3.0, 0.0), c + vec2(-2.0, 3.5)]
+        vec![
+            c + vec2(-2.0, -3.5),
+            c + vec2(3.0, 0.0),
+            c + vec2(-2.0, 3.5),
+        ]
     };
     ui.painter().add(egui::Shape::convex_polygon(
         pts,

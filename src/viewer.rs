@@ -41,7 +41,11 @@ impl View {
     }
 
     pub fn zoom(&self, img: Vec2, avail: Vec2) -> f32 {
-        if self.fit { fit_zoom(img, avail) } else { self.zoom }
+        if self.fit {
+            fit_zoom(img, avail)
+        } else {
+            self.zoom
+        }
     }
 
     pub fn offset(&self) -> Vec2 {

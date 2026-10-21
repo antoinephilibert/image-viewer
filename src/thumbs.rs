@@ -78,7 +78,8 @@ pub fn encode_png(
         ("Thumb::MTime", mtime.to_string()),
         ("Software", "vu".to_string()),
     ] {
-        enc.add_text_chunk(k.to_string(), v).map_err(|e| e.to_string())?;
+        enc.add_text_chunk(k.to_string(), v)
+            .map_err(|e| e.to_string())?;
     }
     let mut writer = enc.write_header().map_err(|e| e.to_string())?;
     writer.write_image_data(rgba).map_err(|e| e.to_string())?;
@@ -158,7 +159,14 @@ pub fn load(path: &Path) -> Result<ColorImage, String> {
     let (rgba, _) = formats::decode_rgba(path, THUMB_SIZE)?;
     if let Some(dest) = cached {
         // Échec d'écriture sans gravité : la vignette reste utilisable.
-        let _ = store(&dest, rgba.width(), rgba.height(), rgba.as_raw(), &uri, mtime);
+        let _ = store(
+            &dest,
+            rgba.width(),
+            rgba.height(),
+            rgba.as_raw(),
+            &uri,
+            mtime,
+        );
     }
     let size = [rgba.width() as usize, rgba.height() as usize];
     Ok(ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
@@ -253,7 +261,10 @@ mod tests {
         image::codecs::jpeg::JpegEncoder::new_with_quality(f, 90)
             .encode_image(&img)
             .unwrap();
-        println!("fichier : {} Mo", fs::metadata(&path).unwrap().len() / 1_000_000);
+        println!(
+            "fichier : {} Mo",
+            fs::metadata(&path).unwrap().len() / 1_000_000
+        );
 
         for _ in 0..3 {
             // Chemin générique : décodage complet puis réduction.

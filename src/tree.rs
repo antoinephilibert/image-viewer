@@ -189,7 +189,12 @@ mod tests {
             name: name.into(),
             is_dir,
         };
-        let mut v = vec![e("b.png", false), e("z", true), e("a.png", false), e("A", true)];
+        let mut v = vec![
+            e("b.png", false),
+            e("z", true),
+            e("a.png", false),
+            e("A", true),
+        ];
         sort_entries(&mut v);
         let names: Vec<_> = v.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["A", "z", "a.png", "b.png"]);
@@ -198,7 +203,11 @@ mod tests {
     #[test]
     fn collapsed_children_are_not_rows() {
         let mut t = Tree::new(PathBuf::from("/r"));
-        let e = |n: &str, d| Entry { path: PathBuf::from(n), name: n.into(), is_dir: d };
+        let e = |n: &str, d| Entry {
+            path: PathBuf::from(n),
+            name: n.into(),
+            is_dir: d,
+        };
         t.set_children(0, vec![e("d", true), e("x.png", false), e(".h.png", false)]);
         assert_eq!(t.visible_rows(false), vec![0, 1, 2]);
         assert_eq!(t.visible_rows(true), vec![0, 1, 2, 3]);

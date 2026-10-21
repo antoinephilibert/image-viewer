@@ -32,14 +32,30 @@ pub enum Priority {
 }
 
 pub enum Job {
-    Dir { epoch: u64, id: NodeId, path: PathBuf },
-    Full { path: PathBuf, max_side: usize },
-    Thumb { path: PathBuf },
+    Dir {
+        epoch: u64,
+        id: NodeId,
+        path: PathBuf,
+    },
+    /// `svg_side` : grand côté visé si le fichier est un SVG (ignoré sinon).
+    Full {
+        path: PathBuf,
+        max_side: usize,
+        svg_side: usize,
+    },
+    /// Re-rastérisation d'un SVG à une nouvelle taille (après un changement de zoom).
+    Svg {
+        path: PathBuf,
+        side: usize,
+    },
+    Thumb {
+        path: PathBuf,
+    },
 }
 
 impl Job {
     fn is_full(&self) -> bool {
-        matches!(self, Job::Full { .. })
+        matches!(self, Job::Full { .. } | Job::Svg { .. })
     }
 
     fn is_thumb(&self) -> bool {
@@ -54,6 +70,10 @@ pub enum Response {
         entries: Vec<Entry>,
     },
     Full {
+        path: PathBuf,
+        result: Result<Decoded, String>,
+    },
+    Svg {
         path: PathBuf,
         result: Result<Decoded, String>,
     },
@@ -188,6 +208,7 @@ impl Loader {
         &mut self,
         targets: &[(PathBuf, Priority)],
         max_side: usize,
+        svg_side: usize,
         is_cached: impl Fn(&Path) -> bool,
     ) {
         let generation = self.shared.generation.fetch_add(1, AtomicOrdering::SeqCst) + 1;
@@ -201,6 +222,7 @@ impl Loader {
             let job = Job::Full {
                 path: path.clone(),
                 max_side,
+                svg_side,
             };
             self.push(*prio, generation, job);
         }
@@ -213,7 +235,11 @@ impl Loader {
         targets: &[(PathBuf, Priority)],
         is_cached: impl Fn(&Path) -> bool,
     ) {
-        let generation = self.shared.thumb_generation.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+        let generation = self
+            .shared
+            .thumb_generation
+            .fetch_add(1, AtomicOrdering::SeqCst)
+            + 1;
         *self.shared.wanted_thumbs.write().unwrap() =
             targets.iter().map(|(p, _)| p.clone()).collect();
         self.shared.queue.clear_thumbs();
@@ -228,6 +254,12 @@ impl Loader {
 
     pub fn is_thumb_wanted(&self, path: &Path) -> bool {
         self.shared.wanted_thumbs.read().unwrap().contains(path)
+    }
+
+    /// Demande une nouvelle rastérisation d'un SVG (image courante, priorité maximale).
+    pub fn request_svg(&mut self, path: PathBuf, side: usize) {
+        let generation = self.shared.generation.load(AtomicOrdering::SeqCst);
+        self.push(Priority::Current, generation, Job::Svg { path, side });
     }
 
     /// Une réponse d'image est utile si son chemin est encore voulu.
@@ -266,7 +298,22 @@ fn worker(shared: &Shared, tx: &Sender<Response>, ctx: &Context) {
                 let entries = read_dir(&path);
                 Some(Response::Dir { epoch, id, entries })
             }
-            Job::Full { path, max_side } => {
+            Job::Svg { path, side } => {
+                if item.generation != shared.generation.load(AtomicOrdering::SeqCst)
+                    || !shared.is_wanted(&path)
+                {
+                    continue;
+                }
+                let result = formats::rasterize_svg(&path, side);
+                shared
+                    .is_wanted(&path)
+                    .then_some(Response::Svg { path, result })
+            }
+            Job::Full {
+                path,
+                max_side,
+                svg_side,
+            } => {
                 // Abandon avant décodage : génération périmée ou image plus voulue.
                 if item.generation != shared.generation.load(AtomicOrdering::SeqCst)
                     || !shared.is_wanted(&path)
@@ -274,10 +321,16 @@ fn worker(shared: &Shared, tx: &Sender<Response>, ctx: &Context) {
                     continue;
                 }
                 shared.in_flight.lock().unwrap().insert(path.clone());
-                let result = formats::decode(&path, max_side);
+                let result = if formats::kind_of(&path) == Some(formats::Kind::Svg) {
+                    formats::rasterize_svg(&path, svg_side.min(max_side))
+                } else {
+                    formats::decode(&path, max_side)
+                };
                 shared.in_flight.lock().unwrap().remove(&path);
                 // Abandon après décodage.
-                shared.is_wanted(&path).then_some(Response::Full { path, result })
+                shared
+                    .is_wanted(&path)
+                    .then_some(Response::Full { path, result })
             }
         };
         if let Some(r) = response {
@@ -407,6 +460,7 @@ mod tests {
             job: Job::Full {
                 path: PathBuf::from(format!("{seq}")),
                 max_side: 1,
+                svg_side: 1,
             },
         }
     }
