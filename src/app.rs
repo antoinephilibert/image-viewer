@@ -94,6 +94,7 @@ pub struct App {
     view: View,
     view_cmd: Option<ViewCmd>,
     fullscreen: bool,
+    show_help: bool,
     /// Size (in points) of the image area in the last frame.
     last_avail: Vec2,
     retarget_needed: bool,
@@ -130,6 +131,7 @@ impl App {
             view: View::default(),
             view_cmd: None,
             fullscreen: false,
+            show_help: false,
             last_avail: Vec2::ZERO,
             retarget_needed: false,
             max_side: 4096,
@@ -387,6 +389,9 @@ impl App {
             action.quit = i.consume_key(Modifiers::NONE, Key::Q);
             action.tab = i.consume_key(Modifiers::NONE, Key::Tab);
             action.escape = i.consume_key(Modifiers::NONE, Key::Escape);
+            // `?` needs Shift on many layouts, so accept it with or without the modifier.
+            action.help = i.consume_key(Modifiers::NONE, Key::Questionmark)
+                || i.consume_key(Modifiers::SHIFT, Key::Questionmark);
             action.fullscreen = i.consume_key(Modifiers::NONE, Key::F11);
             if i.consume_key(Modifiers::NONE, Key::F) {
                 self.view_cmd = Some(ViewCmd::Fit);
@@ -407,7 +412,12 @@ impl App {
             self.fullscreen = !self.fullscreen;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
         }
-        if action.escape && self.fullscreen {
+        if action.help {
+            self.show_help = !self.show_help;
+        }
+        if action.escape && self.show_help {
+            self.show_help = false;
+        } else if action.escape && self.fullscreen {
             self.fullscreen = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         } else if action.quit || action.escape {
@@ -1017,6 +1027,9 @@ impl eframe::App for App {
         CentralPanel::default()
             .frame(egui::Frame::new().fill(BG_IMAGE))
             .show(ui, |ui| self.image_panel(ui));
+        if self.show_help {
+            help_window(ui.ctx());
+        }
     }
 }
 
@@ -1034,6 +1047,7 @@ struct Keys {
     escape: bool,
     tab: bool,
     fullscreen: bool,
+    help: bool,
     next_image: bool,
     prev_image: bool,
 }
@@ -1049,6 +1063,101 @@ enum Click {
     Up,
     Select(NodeId),
     Toggle(NodeId),
+}
+
+/// Shortcut reference shown in the help window: (section, [(keys, action)]).
+const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Navigation",
+        &[
+            ("↑  ↓", "Previous / next item"),
+            ("←  →", "Collapse / expand (tree), previous / next (grid)"),
+            ("Enter", "Expand / collapse a folder"),
+            ("Space  Shift+Space", "Next / previous image in the folder"),
+            ("Tab", "Switch between tree and thumbnails"),
+            ("Backspace", "Go to the parent folder"),
+            (".", "Show / hide hidden files"),
+            ("F5", "Re-read the current folder"),
+        ],
+    ),
+    (
+        "View",
+        &[
+            ("f", "Fit to window"),
+            ("1", "Actual size (100 %)"),
+            ("+  -", "Zoom in / out"),
+            ("F11", "Fullscreen"),
+        ],
+    ),
+    (
+        "Mouse",
+        &[
+            ("Wheel", "Zoom around the cursor"),
+            ("Drag", "Pan the image"),
+            ("Double-click", "Toggle fit / 100 %"),
+        ],
+    ),
+    (
+        "General",
+        &[("?", "Show / hide this help"), ("q  Esc", "Quit")],
+    ),
+];
+
+/// Help window listing the keyboard and mouse shortcuts.
+fn help_window(ctx: &Context) {
+    egui::Window::new("help")
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        .frame(
+            egui::Frame::new()
+                .fill(BG_PANEL)
+                .stroke(egui::Stroke::new(1.0, DIVIDER))
+                .corner_radius(10.0)
+                .inner_margin(egui::Margin::same(20))
+                .shadow(egui::Shadow {
+                    offset: [0, 8],
+                    blur: 24,
+                    spread: 0,
+                    color: Color32::from_black_alpha(140),
+                }),
+        )
+        .show(ctx, |ui| {
+            ui.label(
+                egui::RichText::new("Keyboard & mouse")
+                    .size(17.0)
+                    .strong()
+                    .color(Color32::WHITE),
+            );
+            for (section, rows) in SHORTCUTS {
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new(*section).size(12.0).color(TEXT_DIM));
+                ui.add_space(2.0);
+                egui::Grid::new(("help", *section))
+                    .num_columns(2)
+                    .spacing([18.0, 6.0])
+                    .show(ui, |ui| {
+                        for (keys, action) in *rows {
+                            ui.label(
+                                egui::RichText::new(*keys)
+                                    .monospace()
+                                    .size(12.5)
+                                    .color(Color32::WHITE)
+                                    .background_color(Color32::from_rgb(50, 50, 60)),
+                            );
+                            ui.label(egui::RichText::new(*action).size(13.0).color(TEXT_NORMAL));
+                            ui.end_row();
+                        }
+                    });
+            }
+            ui.add_space(14.0);
+            ui.label(
+                egui::RichText::new("Press ? or Esc to close")
+                    .size(12.0)
+                    .color(TEXT_DIM),
+            );
+        });
 }
 
 /// Welcome screen: faded image icon and a reminder of the shortcuts.
@@ -1085,7 +1194,7 @@ fn paint_empty_state(ui: &egui::Ui, rect: Rect) {
     p.text(
         c + vec2(0.0, 78.0),
         egui::Align2::CENTER_CENTER,
-        "Space: next   Tab: thumbnails   F11: fullscreen   q: quit",
+        "?: help   Space: next   Tab: thumbnails   F11: fullscreen   q: quit",
         egui::FontId::proportional(12.0),
         Color32::from_rgb(86, 86, 98),
     );

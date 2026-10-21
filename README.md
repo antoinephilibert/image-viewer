@@ -78,8 +78,9 @@ Two modes, switched with `Tab`.
 | `+` `-` | Zoom in / out |
 | `F11` | Fullscreen (hides the panel and the status bar) |
 | `F5` | Re-read the current folder |
+| `?` | Show / hide the help window |
 | `q` | Quit |
-| `Esc` | Leave fullscreen, or quit when not fullscreen |
+| `Esc` | Close the help window, leave fullscreen, or quit |
 
 With the mouse: the wheel zooms around the cursor, dragging pans the image, and a double-click toggles between fit and 100 %.
 
