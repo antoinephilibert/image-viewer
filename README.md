@@ -4,6 +4,8 @@ A minimalist image viewer for Linux, written in Rust. Open, browse, look. Nothin
 
 `vu` cannot edit, delete or rename anything. It does one thing and aims to do it fast: the interface should never freeze, even in a folder of thousands of 20 MB photos.
 
+![vu showing a folder tree and the welcome screen](docs/screenshot.png)
+
 ## Highlights
 
 - **Fast by construction.** No decoding, no folder reading and no image downscaling ever happens on the UI thread. A pool of workers serves requests from a priority queue.
