@@ -142,4 +142,8 @@ Volontairement absents : édition, suppression, renommage, diaporama, panneau EX
 
 ## Licence
 
-À définir.
+Distribué sous licence [Apache-2.0](LICENSE).
+
+## Avertissement
+
+Ce projet a été écrit avec [Claude Code](https://claude.com/claude-code), l'assistant de programmation d'Anthropic, à partir d'un cahier des charges rédigé par l'auteur. Le code est testé (tests unitaires, `clippy` sans avertissement) mais il est fourni tel quel, sans garantie : relis-le avant de lui faire confiance.
