@@ -23,6 +23,11 @@ const WHEEL_SENSITIVITY: f32 = 0.0015;
 const BG_IMAGE: Color32 = Color32::from_rgb(24, 24, 27);
 const BG_PANEL: Color32 = Color32::from_rgb(32, 32, 36);
 const SELECTION: Color32 = Color32::from_rgb(56, 98, 168);
+/// Filets discrets entre les zones.
+const DIVIDER: Color32 = Color32::from_rgb(44, 44, 51);
+const TEXT_DIM: Color32 = Color32::from_rgb(128, 128, 138);
+const TEXT_NORMAL: Color32 = Color32::from_rgb(205, 205, 212);
+const FOLDER_TEXT: Color32 = Color32::from_rgb(226, 196, 130);
 
 /// Largeur visée d'une cellule de la grille, en points.
 const TARGET_CELL: f32 = 110.0;
@@ -673,7 +678,11 @@ impl App {
                 let width = ui.available_width();
                 let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW_HEIGHT), Sense::click());
                 if i < up_rows {
-                    paint_label(ui, rect, 0, "..", Color32::GRAY);
+                    if resp.hovered() {
+                        ui.painter()
+                            .rect_filled(row_bg(rect), 4.0, Color32::from_white_alpha(10));
+                    }
+                    paint_label(ui, rect, 0, "..", TEXT_DIM);
                     if resp.clicked() {
                         clicked = Some(Click::Up);
                     }
@@ -681,19 +690,25 @@ impl App {
                 }
                 let id = rows[i - up_rows];
                 let node = &self.tree.nodes[id];
-                if self.selected == Some(id) {
-                    ui.painter().rect_filled(rect, 3.0, SELECTION);
+                let selected = self.selected == Some(id);
+                if selected {
+                    ui.painter().rect_filled(row_bg(rect), 4.0, SELECTION);
+                } else if resp.hovered() {
+                    ui.painter()
+                        .rect_filled(row_bg(rect), 4.0, Color32::from_white_alpha(10));
                 }
                 if node.is_dir {
                     paint_chevron(ui, rect, node.depth, node.expanded);
                 }
                 paint_icon(ui, rect, node.depth, node.is_dir, node.hidden);
-                let color = if node.is_dir {
-                    Color32::from_rgb(230, 200, 130)
+                let color = if selected {
+                    Color32::WHITE
+                } else if node.is_dir {
+                    FOLDER_TEXT
                 } else if node.hidden {
-                    Color32::GRAY
+                    TEXT_DIM
                 } else {
-                    Color32::LIGHT_GRAY
+                    TEXT_NORMAL
                 };
                 paint_label(ui, rect, node.depth, &node.name, color);
                 if resp.double_clicked() {
@@ -716,12 +731,17 @@ impl App {
 
     fn thumbs_panel(&mut self, ui: &mut egui::Ui) {
         let folder = self.current_folder();
-        ui.label(
-            egui::RichText::new(&self.tree.nodes[folder].name)
-                .strong()
-                .color(Color32::LIGHT_GRAY),
-        );
-        ui.add_space(4.0);
+        let count = self.folder_images().len();
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(&self.tree.nodes[folder].name)
+                    .strong()
+                    .color(TEXT_NORMAL),
+            );
+            ui.label(egui::RichText::new(count.to_string()).color(TEXT_DIM));
+        });
+        ui.add_space(6.0);
         ui.spacing_mut().item_spacing = Vec2::ZERO;
 
         let imgs = self.folder_images();
@@ -809,9 +829,14 @@ impl App {
         }
     }
 
-    fn status_text(&self) -> String {
+    /// Texte de la barre d'état : (gauche : fichier, droite : position et zoom).
+    fn status_parts(&self) -> (String, String) {
         let Some(d) = &self.display else {
-            return String::new();
+            let folder = self.current_folder();
+            let count = self.folder_images().len();
+            let name = &self.tree.nodes[folder].name;
+            let noun = if count > 1 { "images" } else { "image" };
+            return (format!("{name}   ·   {count} {noun}"), String::new());
         };
         let name = d
             .path
@@ -822,7 +847,7 @@ impl App {
         let pos = imgs
             .iter()
             .position(|&i| self.tree.nodes[i].path == d.path)
-            .map(|p| format!("{}/{}", p + 1, imgs.len()))
+            .map(|p| format!("{} / {}", p + 1, imgs.len()))
             .unwrap_or_default();
         let loading = if self.selected_image_path().as_ref() == Some(&d.path) {
             ""
@@ -832,13 +857,15 @@ impl App {
         match &d.item {
             Ok(c) => {
                 let [w, h] = c.original_size;
-                format!(
-                    "{name}   {w}×{h}   {}   {pos}   {}{loading}",
-                    human_size(c.file_size),
-                    self.zoom_label(c),
+                (
+                    format!(
+                        "{name}   ·   {w} × {h}   ·   {}{loading}",
+                        human_size(c.file_size)
+                    ),
+                    format!("{}   ·   {pos}", self.zoom_label(c)),
                 )
             }
-            Err(_) => format!("{name}   {pos}{loading}"),
+            Err(_) => (format!("{name}{loading}"), pos),
         }
     }
 
@@ -856,7 +883,10 @@ impl App {
         ui.painter().rect_filled(rect, 0.0, BG_IMAGE);
         self.last_avail = rect.size();
         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
-        let Some(display) = &self.display else { return };
+        let Some(display) = &self.display else {
+            paint_empty_state(ui, rect);
+            return;
+        };
         let cached = match &display.item {
             Ok(c) => c.clone(),
             Err(err) => {
@@ -946,23 +976,43 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if !self.fullscreen {
-            let panel_frame = egui::Frame::new()
-                .fill(BG_PANEL)
-                .inner_margin(egui::Margin::symmetric(8, 6));
-            Panel::bottom("status")
-                .frame(panel_frame)
-                .exact_size(26.0)
+            let (left, right) = self.status_parts();
+            let status = Panel::bottom("status")
+                .frame(
+                    egui::Frame::new()
+                        .fill(BG_PANEL)
+                        .inner_margin(egui::Margin::symmetric(12, 0)),
+                )
+                .exact_size(28.0)
                 .show(ui, |ui| {
-                    ui.label(egui::RichText::new(self.status_text()).color(Color32::GRAY));
+                    ui.horizontal_centered(|ui| {
+                        ui.label(egui::RichText::new(left).size(12.5).color(TEXT_NORMAL));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(egui::RichText::new(right).size(12.5).color(TEXT_DIM));
+                        });
+                    });
                 });
-            Panel::left("tree")
-                .frame(egui::Frame::new().fill(BG_PANEL).inner_margin(4))
+            let rect = status.response.rect;
+            ui.painter()
+                .hline(rect.x_range(), rect.top(), egui::Stroke::new(1.0, DIVIDER));
+            let side = Panel::left("tree")
+                .frame(
+                    egui::Frame::new()
+                        .fill(BG_PANEL)
+                        .inner_margin(egui::Margin::symmetric(2, 6)),
+                )
                 .resizable(true)
-                .default_size(280.0)
+                .default_size(300.0)
                 .show(ui, |ui| match self.mode {
                     Mode::Tree => self.tree_panel(ui),
                     Mode::Thumbs => self.thumbs_panel(ui),
                 });
+            let rect = side.response.rect;
+            ui.painter().vline(
+                rect.right(),
+                rect.y_range(),
+                egui::Stroke::new(1.0, DIVIDER),
+            );
         }
         CentralPanel::default()
             .frame(egui::Frame::new().fill(BG_IMAGE))
@@ -1001,15 +1051,64 @@ enum Click {
     Toggle(NodeId),
 }
 
+/// Écran d'accueil : icône d'image estompée et rappel des raccourcis.
+fn paint_empty_state(ui: &egui::Ui, rect: Rect) {
+    let p = ui.painter();
+    let c = rect.center() + vec2(0.0, -24.0);
+    let frame = Rect::from_center_size(c, vec2(64.0, 52.0));
+    let dim = Color32::from_rgb(58, 58, 68);
+    p.rect_stroke(
+        frame,
+        8.0,
+        egui::Stroke::new(2.5, dim),
+        egui::StrokeKind::Inside,
+    );
+    p.circle_filled(frame.min + vec2(46.0, 15.0), 5.0, dim);
+    p.add(egui::Shape::convex_polygon(
+        vec![
+            frame.left_bottom() + vec2(6.0, -6.0),
+            frame.left_bottom() + vec2(22.0, -26.0),
+            frame.left_bottom() + vec2(34.0, -12.0),
+            frame.left_bottom() + vec2(41.0, -19.0),
+            frame.right_bottom() + vec2(-6.0, -6.0),
+        ],
+        dim,
+        egui::Stroke::NONE,
+    ));
+    p.text(
+        c + vec2(0.0, 54.0),
+        egui::Align2::CENTER_CENTER,
+        "Sélectionne une image",
+        egui::FontId::proportional(15.0),
+        Color32::from_rgb(120, 120, 132),
+    );
+    p.text(
+        c + vec2(0.0, 78.0),
+        egui::Align2::CENTER_CENTER,
+        "Espace : suivante   Tab : vignettes   F11 : plein écran   q : quitter",
+        egui::FontId::proportional(12.0),
+        Color32::from_rgb(86, 86, 98),
+    );
+}
+
+/// Fond d'une ligne : légèrement en retrait des bords du panneau.
+fn row_bg(rect: Rect) -> Rect {
+    rect.shrink2(vec2(4.0, 1.0))
+}
+
+/// Libellé tronqué avec « … » plutôt que coupé net au bord du panneau.
 fn paint_label(ui: &egui::Ui, rect: Rect, depth: usize, text: &str, color: Color32) {
     let x = rect.left() + 38.0 + depth as f32 * INDENT;
-    ui.painter().text(
-        pos2(x, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        text,
+    let max_width = (rect.right() - 10.0 - x).max(0.0);
+    let mut job = egui::text::LayoutJob::simple_singleline(
+        text.to_owned(),
         egui::FontId::proportional(13.5),
         color,
     );
+    job.wrap = egui::text::TextWrapping::truncate_at_width(max_width);
+    let galley = ui.painter().layout_job(job);
+    let pos = pos2(x, rect.center().y - galley.size().y / 2.0);
+    ui.painter().galley(pos, galley, color);
 }
 
 /// Icône dessinée à la main : dossier (onglet + corps) ou image (cadre + montagne).
