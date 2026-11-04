@@ -1,7 +1,8 @@
-//! Lazily loaded folder tree and natural sort order.
+//! Lazily loaded folder tree and its sort order (newest first, natural order on ties).
 
 use std::cmp::Ordering;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 pub type NodeId = usize;
 
@@ -10,6 +11,8 @@ pub struct Entry {
     pub path: PathBuf,
     pub name: String,
     pub is_dir: bool,
+    /// Modification time, used for sorting only. `None` if unavailable.
+    pub modified: Option<SystemTime>,
 }
 
 pub struct Node {
@@ -105,11 +108,14 @@ impl Tree {
     }
 }
 
-/// Order: folders first, then case-insensitive natural order.
+/// Order: files first, then folders; newest first within each group.
+/// Entries without a date come last in their group; ties fall back to natural
+/// order.
 pub fn sort_entries(entries: &mut [Entry]) {
     entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
+        a.is_dir
+            .cmp(&b.is_dir)
+            .then_with(|| b.modified.cmp(&a.modified))
             .then_with(|| natural_cmp(&a.name, &b.name))
     });
 }
@@ -159,6 +165,7 @@ fn take_digits(it: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
     fn numbers_compare_by_value() {
@@ -182,32 +189,54 @@ mod tests {
         assert_eq!(natural_cmp("img", "img1"), Ordering::Less);
     }
 
-    #[test]
-    fn dirs_come_first() {
-        let e = |name: &str, is_dir| Entry {
+    fn entry(name: &str, is_dir: bool, secs: Option<u64>) -> Entry {
+        Entry {
             path: PathBuf::from(name),
             name: name.into(),
             is_dir,
-        };
-        let mut v = vec![
-            e("b.png", false),
-            e("z", true),
-            e("a.png", false),
-            e("A", true),
-        ];
+            modified: secs.map(|s| UNIX_EPOCH + Duration::from_secs(s)),
+        }
+    }
+
+    fn sorted_names(mut v: Vec<Entry>) -> Vec<String> {
         sort_entries(&mut v);
-        let names: Vec<_> = v.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, ["A", "z", "a.png", "b.png"]);
+        v.into_iter().map(|e| e.name).collect()
+    }
+
+    #[test]
+    fn files_then_dirs_newest_first() {
+        let names = sorted_names(vec![
+            entry("old_dir", true, Some(10)),
+            entry("old.png", false, Some(20)),
+            entry("new_dir", true, Some(40)),
+            entry("new.png", false, Some(30)),
+        ]);
+        assert_eq!(names, ["new.png", "old.png", "new_dir", "old_dir"]);
+    }
+
+    #[test]
+    fn same_date_falls_back_to_natural_order() {
+        let names = sorted_names(vec![
+            entry("img10.png", false, Some(5)),
+            entry("img2.png", false, Some(5)),
+        ]);
+        assert_eq!(names, ["img2.png", "img10.png"]);
+    }
+
+    #[test]
+    fn missing_date_comes_last_in_its_group() {
+        let names = sorted_names(vec![
+            entry("a.png", false, None),
+            entry("b.png", false, Some(1)),
+            entry("c", true, Some(2)),
+        ]);
+        assert_eq!(names, ["b.png", "a.png", "c"]);
     }
 
     #[test]
     fn collapsed_children_are_not_rows() {
         let mut t = Tree::new(PathBuf::from("/r"));
-        let e = |n: &str, d| Entry {
-            path: PathBuf::from(n),
-            name: n.into(),
-            is_dir: d,
-        };
+        let e = |n: &str, d| entry(n, d, None);
         t.set_children(0, vec![e("d", true), e("x.png", false), e(".h.png", false)]);
         assert_eq!(t.visible_rows(false), vec![0, 1, 2]);
         assert_eq!(t.visible_rows(true), vec![0, 1, 2, 3]);

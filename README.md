@@ -61,7 +61,7 @@ JPEG, PNG, WebP, GIF (first frame only), BMP, TIFF and SVG. EXIF orientation is 
 
 Two modes, switched with `Tab`.
 
-- **Tree** (default): the root is the folder you opened. Only folders and supported images are shown, folders first, then case-insensitive natural order (`img2` before `img10`). A folder's contents are only read when you expand it.
+- **Tree** (default): the root is the folder you opened. Only folders and supported images are shown: images first, then folders, newest first within each group (by modification time). Entries with the same date fall back to case-insensitive natural order (`img2` before `img10`). A folder's contents are only read when you expand it.
 - **Thumbnails**: a grid of the current folder's images. The number of columns follows the panel width, and only the visible thumbnails (plus a margin) are requested.
 
 ### Keyboard shortcuts
@@ -109,7 +109,7 @@ VU_BENCH_DIR=/tmp cargo test --release bench_jpeg -- --ignored --nocapture
 src/
   main.rs     command line, window setup
   app.rs      application state, egui loop, panels and keyboard
-  tree.rs     lazy tree and natural sort order
+  tree.rs     lazy tree and sort order
   thumbs.rs   grid, freedesktop disk cache (256 px PNG, MD5 key of the URI)
   loader.rs   workers, priority queue, generations, LRU caches
   viewer.rs   zoom and pan (pure, tested functions)

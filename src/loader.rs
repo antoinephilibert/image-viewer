@@ -352,7 +352,8 @@ fn read_dir(path: &Path) -> Vec<Entry> {
         .filter_map(|e| {
             let path = e.path();
             // `fs::metadata` follows symlinks.
-            let is_dir = std::fs::metadata(&path).ok()?.is_dir();
+            let meta = std::fs::metadata(&path).ok()?;
+            let is_dir = meta.is_dir();
             if !is_dir && formats::kind_of(&path).is_none() {
                 return None;
             }
@@ -360,6 +361,7 @@ fn read_dir(path: &Path) -> Vec<Entry> {
                 name: e.file_name().to_string_lossy().into_owned(),
                 path,
                 is_dir,
+                modified: meta.modified().ok(),
             })
         })
         .collect();
